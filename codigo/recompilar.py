@@ -13,8 +13,8 @@ from pathlib import Path
 
 
 BASE = Path(__file__).resolve().parent
-SOURCES = ("app.py", "core.py", "Iniciar.cmd", "Compilar.cmd", "recompilar.py",
-           "test_core.py", "test_app.py", "LEEME.md")
+SOURCES = ("app.py", "core.py", "registro.py", "Iniciar.cmd", "Compilar.cmd", "recompilar.py",
+           "test_core.py", "test_registro.py", "test_app.py", "LEEME.md")
 
 
 def run(command, env, **kwargs):
@@ -43,7 +43,7 @@ def main():
 
     source_bytes = {name: (BASE / name).read_bytes() for name in SOURCES}
     print("\n1/4  Verificando cálculos e interfaz…", flush=True)
-    run([python, "-m", "unittest", "-v", "test_core", "test_app"], environment)
+    run([python, "-m", "unittest", "-v", "test_core", "test_registro", "test_app"], environment)
 
     print("\n2/4  Compilando el diseño actual…", flush=True)
     staging = BASE / "build" / "release"

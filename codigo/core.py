@@ -101,6 +101,26 @@ class SearchResult:
         return self.target - self.total
 
 
+@dataclass(frozen=True)
+class Payment:
+    """Un pago a cubrir, opcionalmente limitado a los e-cheques de un cliente."""
+    target: int
+    client_id: Optional[str] = None
+    client_name: str = ""
+
+    @property
+    def label(self) -> str:
+        if self.client_id is None:
+            return "Todos los clientes"
+        return " · ".join(part for part in (self.client_id, self.client_name) if part)
+
+
+@dataclass
+class PaymentOutcome:
+    payment: Payment
+    result: Optional[SearchResult]  # None: no se llegó a calcular (búsqueda detenida)
+
+
 def parse_date(value: str) -> Optional[date]:
     """Fecha humana opcional; no corrige silenciosamente fechas imposibles."""
     value = str(value).strip()
@@ -505,6 +525,38 @@ def find_combination(checks: List[Check], target: int, cancel=None,
     return from_mask(best_mask, True)
 
 
+def find_payments(checks: List[Check], payments: List[Payment], progressive: bool = True,
+                  date_field: str = "G", start: Optional[date] = None, end: Optional[date] = None,
+                  prefer_previous: bool = True, cancel=None,
+                  progress: Optional[Callable[[str], None]] = None) -> List[PaymentOutcome]:
+    """Calcula los pagos en el orden dado; un e-cheque elegido no se ofrece a los siguientes.
+
+    Cada pago aplica su cliente y el rango de fechas sobre lo que quedó libre.
+    Si se cancela, el pago en curso conserva una selección válida y los
+    siguientes quedan sin calcular (result None).
+    """
+    pool = list(checks)
+    outcomes = []
+    for number, payment in enumerate(payments, 1):
+        if cancel is not None and cancel.is_set():
+            outcomes.append(PaymentOutcome(payment, None))
+            continue
+        records = [c for c in pool if payment.client_id is None or c.client_id == payment.client_id]
+        candidates, _ = filter_checks(records, date_field, start, end)
+        report = progress
+        if progress and len(payments) > 1:
+            report = lambda message, n=number: progress("Pago {} de {} · {}".format(n, len(payments), message))
+        if progressive:
+            result = find_progressive(candidates, payment.target, cancel, report, date_field, prefer_previous)
+        else:
+            result = find_combination(candidates, payment.target, cancel, report)
+            result.date_field = date_field
+        taken = {check.row for check in result.checks}
+        pool = [c for c in pool if c.row not in taken]
+        outcomes.append(PaymentOutcome(payment, result))
+    return outcomes
+
+
 def customer_message(result: SearchResult) -> str:
     if not result.checks:
         return ("Para completar el importe de {}, no se seleccionaron e-cheques. "
@@ -514,3 +566,13 @@ def customer_message(result: SearchResult) -> str:
     if result.transfer:
         return message + "El importe restante a completar por transferencia es {}.".format(money(result.transfer))
     return message + "El importe queda cubierto; no hace falta completar por transferencia."
+
+
+def payments_message(outcomes: List[PaymentOutcome]) -> str:
+    if len(outcomes) == 1 and outcomes[0].result is not None:
+        return customer_message(outcomes[0].result)
+    lines = []
+    for number, outcome in enumerate(outcomes, 1):
+        text = "sin calcular." if outcome.result is None else customer_message(outcome.result)
+        lines.append("Pago {} ({}): {}".format(number, outcome.payment.label, text))
+    return "\n".join(lines)
