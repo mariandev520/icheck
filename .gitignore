@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# Datos propios de cada instalación: no van al repositorio ni al ZIP
+registro_echeques.json

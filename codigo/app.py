@@ -11,9 +11,10 @@ from datetime import date
 from pathlib import Path
 from tkinter import filedialog, font, messagebox, ttk
 
-from core import (DataError, batch_label, check_date, customer_message, filter_checks,
-                  find_combination, find_progressive, list_sheets, money, parse_amount,
-                  parse_date, read_excel)
+from core import (SPLIT_SECONDS, DataError, Payment, batch_label, check_date, filter_checks,
+                  find_payments, list_sheets, money, parse_amount, parse_date, payments_message,
+                  read_excel)
+from registro import Registry, default_path, format_timestamp
 
 
 # --- PALETA INTERMEDIA SLATE-DARK / GRISES NEUTROS ---
@@ -36,11 +37,18 @@ AMBER        = "#FBBF24"    # Diferencia transferencia (Amber 400)
 
 
 class Application:
-    def __init__(self, root):
+    def __init__(self, root, registry_path=None):
         self.root = root
         self.path = None
         self.imported = None
-        self.result = None
+        self.registry_path = Path(registry_path) if registry_path else default_path()
+        self.payments = []
+        self.results = None
+        self.registered = False
+        self.saved_info = None       # (nombre, pagos, e-cheques) de la operación recién guardada
+        self.saved_operation = None
+        self.available = []
+        self.client_names = {}
         self.busy = False
         self.events = queue.Queue()
         self.cancel = threading.Event()
@@ -57,6 +65,10 @@ class Application:
         self.file_label = tk.StringVar(value="Cargá un archivo Excel para comenzar")
         self.file_detail = tk.StringVar(value="Formato .xlsx con estructura oficial de e-cheques.")
         self.notice = tk.StringVar(value="Las fechas e identificadores originales se conservan sin modificaciones.")
+        self.registry_info = tk.StringVar()
+        self.payments_title = tk.StringVar(value="Pagos cargados (0)")
+        self.operation_name = tk.StringVar()
+        self.save_state = tk.StringVar()
         self.status = tk.StringVar(value="Listo para iniciar. Seleccioná un archivo .xlsx.")
         self.result_title = tk.StringVar(value="Resultados de la búsqueda")
         self.result_detail = tk.StringVar(value="Primero el monto exacto; si no, el más cercano sin pasarse.")
@@ -73,9 +85,10 @@ class Application:
         self._result_timers = set()
 
         self._build()
-        for variable in (self.target, self.client, self.date_field, self.date_from,
-                         self.date_to, self.strategy, self.prefer_previous):
+        # Importe y cliente solo preparan el próximo pago: no invalidan lo ya calculado.
+        for variable in (self.date_field, self.date_from, self.date_to, self.strategy, self.prefer_previous):
             variable.trace_add("write", self._invalidate)
+        self._refresh_availability()
         self.poll_timer = self.root.after(100, self._poll)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -195,6 +208,8 @@ class Application:
         style.map("Treeview.Heading", background=[("active", BG_HOVER)])
         style.map("Treeview", background=[("selected", CYAN_DIM)], foreground=[("selected", TEXT_HIGH)])
 
+        style.configure("Payments.Treeview", rowheight=26)
+
         # Scrollbar estilizado
         style.configure("TScrollbar", background=BG_SURFACE, troughcolor=BG_CANVAS, borderwidth=0, arrowsize=11)
 
@@ -230,7 +245,7 @@ class Application:
         main_container.bind("<Configure>", resize_content)
         self.main_canvas.bind("<Configure>", resize_content)
         def page_wheel(event):
-            if event.widget is not self.table and event.widget.winfo_toplevel() == root:
+            if event.widget not in (self.table, self.payment_table) and event.widget.winfo_toplevel() == root:
                 self.main_canvas.yview_scroll(-int(event.delta / 120), "units")
         root.bind("<MouseWheel>", page_wheel)
 
@@ -250,6 +265,8 @@ class Application:
                  font=(FONT_FAMILY, 8, "bold")).pack(side="left")
         self.notes_button = ttk.Button(fc_head, text="Ver detalle", command=self.show_import_notes, state="disabled")
         self.notes_button.pack(side="right")
+        self.registry_button = ttk.Button(fc_head, text="Registro…", command=self.show_registry)
+        self.registry_button.pack(side="right", padx=(0, 6))
 
         tk.Label(file_card, textvariable=self.file_label, bg=BG_PANEL, fg=TEXT_HIGH,
                  font=(FONT_FAMILY, 11, "bold"), anchor="w").pack(fill="x")
@@ -270,6 +287,8 @@ class Application:
 
         tk.Label(file_card, textvariable=self.notice, bg=BG_PANEL, fg=TEXT_MUTED,
                  font=(FONT_FAMILY, 8), anchor="w", wraplength=480, justify="left").pack(fill="x")
+        tk.Label(file_card, textvariable=self.registry_info, bg=BG_PANEL, fg=TEXT_MID,
+                 font=(FONT_FAMILY, 8), anchor="w", wraplength=480, justify="left").pack(fill="x", pady=(4, 0))
 
         dates_frame = tk.Frame(file_card, bg=BG_PANEL)
         dates_frame.pack(fill="x", pady=(10, 0))
@@ -303,7 +322,7 @@ class Application:
 
         ec_head = tk.Frame(entry_card, bg=BG_PANEL)
         ec_head.pack(fill="x", pady=(0, 8))
-        tk.Label(ec_head, text="2. IMPORTE A CUBRIR", bg=BG_PANEL, fg=TEXT_MUTED,
+        tk.Label(ec_head, text="2. PAGOS A CUBRIR", bg=BG_PANEL, fg=TEXT_MUTED,
                  font=(FONT_FAMILY, 8, "bold")).pack(side="left")
         self.cancel_button = ttk.Button(ec_head, text="Detener búsqueda", command=self.stop, state="disabled", style="Danger.TButton")
         self.cancel_button.pack(side="right")
@@ -311,19 +330,46 @@ class Application:
         inputs_frame = tk.Frame(entry_card, bg=BG_PANEL)
         inputs_frame.pack(fill="x", pady=(0, 8))
 
+        add_box = tk.Frame(inputs_frame, bg=BG_PANEL)
+        add_box.pack(side="right", anchor="s", padx=(10, 0))
+        self.add_button = ttk.Button(add_box, text="Agregar pago", command=self.add_payment, state="disabled")
+        self.add_button.pack()
+
         amount_box = tk.Frame(inputs_frame, bg=BG_PANEL)
-        amount_box.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        amount_box.pack(side="left", padx=(0, 10))
         tk.Label(amount_box, text="Monto objetivo ($):", bg=BG_PANEL, fg=TEXT_MUTED, font=(FONT_FAMILY, 8, "bold")).pack(anchor="w")
-        self.amount_entry = ttk.Entry(amount_box, textvariable=self.target, font=(FONT_FAMILY, 12, "bold"))
+        self.amount_entry = ttk.Entry(amount_box, textvariable=self.target, font=(FONT_FAMILY, 12, "bold"), width=15)
         self.amount_entry.pack(fill="x", pady=(2, 0))
-        self.amount_entry.bind("<Return>", lambda event: self.search())
+        self.amount_entry.bind("<Return>", lambda event: self.add_payment())
 
         client_box_wrapper = tk.Frame(inputs_frame, bg=BG_PANEL)
         client_box_wrapper.pack(side="left", fill="x", expand=True)
         tk.Label(client_box_wrapper, text="Cliente:", bg=BG_PANEL, fg=TEXT_MUTED, font=(FONT_FAMILY, 8, "bold")).pack(anchor="w")
         self.client_box = ttk.Combobox(client_box_wrapper, textvariable=self.client, state="disabled")
         self.client_box.pack(fill="x", pady=(2, 0))
-        self.client_box.bind("<<ComboboxSelected>>", self._invalidate)
+
+        payments_head = tk.Frame(entry_card, bg=BG_PANEL)
+        payments_head.pack(fill="x")
+        tk.Label(payments_head, textvariable=self.payments_title, bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, 8, "bold")).pack(side="left")
+        link_style = dict(bg=BG_PANEL, fg=CYAN, activebackground=BG_PANEL, activeforeground=TEXT_HIGH,
+                          relief="flat", borderwidth=0, highlightthickness=0, font=(FONT_FAMILY, 8), padx=3, pady=0)
+        self.clear_payments_button = tk.Button(payments_head, text="Vaciar", command=self.clear_payments, **link_style)
+        self.clear_payments_button.pack(side="right")
+        self.remove_button = tk.Button(payments_head, text="Quitar seleccionado", command=self.remove_payment, **link_style)
+        self.remove_button.pack(side="right", padx=(0, 6))
+
+        payments_frame = tk.Frame(entry_card, bg=BG_PANEL)
+        payments_frame.pack(fill="x", pady=(2, 8))
+        self.payment_table = ttk.Treeview(payments_frame, columns=("n", "client", "amount"), show="headings",
+                                          height=3, style="Payments.Treeview")
+        for col, title, width, anchor in (("n", "#", 40, "w"), ("client", "Cliente", 200, "w"), ("amount", "Importe", 130, "e")):
+            self.payment_table.heading(col, text=title)
+            self.payment_table.column(col, width=width, minwidth=width, anchor=anchor, stretch=col == "client")
+        payments_scroll = ttk.Scrollbar(payments_frame, orient="vertical", command=self.payment_table.yview)
+        self.payment_table.configure(yscrollcommand=payments_scroll.set)
+        self.payment_table.pack(side="left", fill="x", expand=True)
+        payments_scroll.pack(side="left", fill="y")
 
         search_options = tk.Frame(entry_card, bg=BG_PANEL)
         search_options.pack(fill="x", pady=(2, 8))
@@ -334,16 +380,17 @@ class Application:
             variable=self.prefer_previous, bg=BG_PANEL, fg=TEXT_MID, selectcolor=BG_SURFACE,
             activebackground=BG_PANEL, activeforeground=TEXT_HIGH, font=(FONT_FAMILY, 9), anchor="w")
         self.previous_toggle.pack(fill="x", pady=(4, 0))
-        tk.Label(search_options, text="Exacto al saldo primero. Semanas de lunes a domingo.",
-                 bg=BG_PANEL, fg=TEXT_MUTED, font=(FONT_FAMILY, 8)).pack(anchor="w")
+        tk.Label(search_options, text="Exacto al saldo primero. Semanas de lunes a domingo. "
+                 "Cada e-cheque se usa en un solo pago.",
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=(FONT_FAMILY, 8), wraplength=470, justify="left").pack(anchor="w")
 
         ec_actions = tk.Frame(entry_card, bg=BG_PANEL)
         ec_actions.pack(fill="x", pady=(4, 0))
         self.search_button = ttk.Button(ec_actions, text="Buscar combinación", command=self.search,
                                         style="Primary.TButton", state="disabled")
         self.search_button.pack(side="left")
-        tk.Label(ec_actions, text="Presioná Enter para calcular", bg=BG_PANEL, fg=TEXT_MUTED,
-                 font=(FONT_FAMILY, 8)).pack(side="left", padx=10)
+        tk.Label(ec_actions, text="Enter agrega el pago · Buscar calcula todos en orden", bg=BG_PANEL,
+                 fg=TEXT_MUTED, font=(FONT_FAMILY, 8)).pack(side="left", padx=10)
 
         # PANELES DE MÉTRICAS (KPIs)
         summary = tk.Frame(main_container, bg=BG_CANVAS)
@@ -365,6 +412,31 @@ class Application:
             val_lbl.pack(anchor="w", pady=(4, 0))
             self.kpi_labels.append((val_lbl, color))
             summary.columnconfigure(col_idx, weight=1, uniform="kpi")
+
+        # GUARDAR LA OPERACIÓN EN EL REGISTRO (siempre visible; se habilita al calcular)
+        save_bar = tk.Frame(main_container, bg=BG_PANEL, padx=18, pady=12, highlightthickness=1, highlightbackground=CYAN_DIM)
+        save_bar.pack(fill="x", pady=(0, 12))
+        save_left = tk.Frame(save_bar, bg=BG_PANEL)
+        save_left.pack(side="left", fill="x", expand=True)
+        tk.Label(save_left, text="3. GUARDAR OPERACIÓN", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, 8, "bold")).pack(anchor="w")
+        self.save_label = tk.Label(save_left, textvariable=self.save_state, bg=BG_PANEL, fg=TEXT_MID,
+                                   font=(FONT_FAMILY, 9), anchor="w", justify="left", wraplength=600)
+        self.save_label.pack(anchor="w", pady=(2, 6))
+        name_row = tk.Frame(save_left, bg=BG_PANEL)
+        name_row.pack(fill="x")
+        tk.Label(name_row, text="Nombre de la operación (opcional):", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, 8)).pack(side="left")
+        self.operation_entry = ttk.Entry(name_row, textvariable=self.operation_name, width=32, state="disabled")
+        self.operation_entry.pack(side="left", padx=(8, 0))
+        self.operation_entry.bind("<Return>", lambda event: self.register())
+        save_right = tk.Frame(save_bar, bg=BG_PANEL)
+        save_right.pack(side="right", padx=(12, 0))
+        self.register_button = ttk.Button(save_right, text="Guardar operación", command=self.register,
+                                          state="disabled", style="Primary.TButton")
+        self.register_button.pack(anchor="e")
+        self.saved_button = ttk.Button(save_right, text="Ver en el registro", command=self.show_saved, state="disabled")
+        self.saved_button.pack(anchor="e", pady=(6, 0))
 
         # TABLA DE CHEQUES
         table_card = tk.Frame(main_container, bg=BG_PANEL, padx=18, pady=14, highlightthickness=1, highlightbackground=BORDER)
@@ -392,7 +464,9 @@ class Application:
         table_frame.pack(fill="both", expand=True)
 
         columns = ("row", "reference", "date_f", "date_g", "id", "name", "amount", "receipt", "batch", "balance")
-        self.table = ttk.Treeview(table_frame, columns=columns, show="headings", height=5)
+        self.table = ttk.Treeview(table_frame, columns=columns, show="tree headings", height=8)
+        self.table.heading("#0", text="Pago")
+        self.table.column("#0", width=80, minwidth=80, stretch=False, anchor="w")
         headings = ("Fila", "Referencia", "Fecha F", "Fecha G", "ID Cliente", "Cliente", "Importe", "Recibo", "Tanda semanal", "Saldo restante")
         widths = (55, 110, 95, 95, 90, 160, 120, 110, 195, 125)
         for col, title, width in zip(columns, headings, widths):
@@ -401,6 +475,7 @@ class Application:
         self.table.configure(displaycolumns=("reference", "amount", "batch", "balance", "date_f", "date_g", "id", "name", "receipt", "row"))
         self.table.tag_configure("alternate", background="#202530")
         self.table.tag_configure("glow", background="#1E394A", foreground=CYAN)
+        self.table.tag_configure("payment", background=BG_SURFACE, foreground=TEXT_HIGH)
 
         vertical = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
         horizontal = ttk.Scrollbar(table_frame, orient="horizontal", command=self.table.xview)
@@ -534,23 +609,26 @@ class Application:
     def _on_window_resize(self, event):
         if event.widget == self.root:
             self.message_label.configure(wraplength=max(400, self.root.winfo_width() - 80))
-            self.result_detail_label.configure(wraplength=max(300, self.root.winfo_width() - 430))
+            self.result_detail_label.configure(wraplength=max(300, self.root.winfo_width() - 440))
+            self.save_label.configure(wraplength=max(360, self.root.winfo_width() - 330))
 
     def _invalidate(self, *args):
         if self.busy:
             return
-        self.result = None
+        self.results = None
+        self.registered = False
+        self.saved_info = self.saved_operation = None
+        self.operation_name.set("")
         self._stop_result_animations()
         self.search_context = {}
         self.table.delete(*self.table.get_children())
         for value in (self.target_total, self.check_total, self.transfer_total):
             value.set("$ —")
-        self.copy_button.configure(state="disabled")
-        self.export_button.configure(state="disabled")
+        self._update_actions()
         self.result_title.set("Resultados de la búsqueda")
-        self.result_detail.set("Cada fila del Excel se puede usar una sola vez en cada cálculo.")
+        self.result_detail.set("Cada e-cheque se usa una sola vez: no se repite entre pagos ni en pagos ya registrados.")
         self.message.set("Al calcular, vas a poder copiar el resumen para el cliente.")
-        self.status.set("Ingresá el importe y presioná Buscar combinación.")
+        self.status.set("Agregá los pagos y presioná Buscar combinación.")
         self.previous_toggle.configure(state="normal" if self.strategy.get().startswith("Progresiva") else "disabled")
 
     def _set_busy(self, busy, searching=False):
@@ -561,6 +639,10 @@ class Application:
         self.sheet_box.configure(state="disabled" if busy or not self.path else "readonly")
         self.client_box.configure(state="disabled" if busy or not ready else "readonly")
         self.search_button.configure(state="disabled" if busy or not ready else "normal")
+        self.add_button.configure(state="disabled" if busy or not ready else "normal")
+        for widget in (self.remove_button, self.clear_payments_button):
+            widget.configure(state="disabled" if busy or not ready else "normal")
+        self.registry_button.configure(state="disabled" if busy else "normal")
         self.cancel_button.configure(state="normal" if busy and searching else "disabled")
         self.notes_button.configure(state="normal" if not busy and self.imported else "disabled")
         for widget in self.date_entries + self.calendar_buttons + [self.clear_dates_button]:
@@ -568,6 +650,7 @@ class Application:
         for widget in (self.date_box, self.strategy_box):
             widget.configure(state="disabled" if busy else "readonly")
         self.previous_toggle.configure(state="normal" if not busy and self.strategy.get().startswith("Progresiva") else "disabled")
+        self._update_actions()
         if busy:
             self._start_animations()
         else:
@@ -666,14 +749,17 @@ class Application:
         self.sheet.set(self.imported.sheet)
         self.file_label.set(Path(self.path).name)
         checks = self.imported.checks
+        self._invalidate()
         client_names = {check.client_id: check.client_name for check in checks}
+        self.client_names = client_names
+        self.payments = []
+        self._refresh_payments()
         self.clients = {"{} · {}".format(identifier, name): identifier for identifier, name in sorted(client_names.items())}
         self.client_box.configure(values=["Todos los clientes"] + list(self.clients))
         self.client.set("Todos los clientes")
         self.date_from.set("")
         self.date_to.set("")
-        self.file_detail.set("{} e-cheques · {} clientes · Total disponible: {}".format(
-            len(checks), len(client_names), money(sum(check.amount for check in checks))))
+        self._refresh_availability()
         if self.imported.rejected:
             self.notice.set("{} filas excluidas por datos incompletos o importes inválidos. Revisá el detalle antes de buscar. {} observaciones conservadas.".format(
                 len(self.imported.rejected), len(self.imported.notes)))
@@ -689,39 +775,123 @@ class Application:
         elif self.imported.rejected:
             self.show_import_notes()
 
+    # --- DISPONIBILIDAD SEGÚN EL REGISTRO ---
+    def _refresh_availability(self):
+        """Relee el registro y deja a la vista qué e-cheques del Excel siguen disponibles."""
+        checks = self.imported.checks if self.imported else []
+        try:
+            registry = Registry.load(self.registry_path)
+        except DataError as exc:
+            self.available = []
+            self.registry_info.set("⚠ " + str(exc))
+            if self.imported:
+                self.file_detail.set("{} e-cheques · el registro no se pudo leer; no se puede buscar".format(len(checks)))
+            return None
+        self.available, used = registry.split(checks)
+        active = [payment for payment in registry.payments if not payment.voided]
+        if not self.registry_path.exists():
+            self.registry_info.set("Registro nuevo: se crea al guardar la primera operación ({}).".format(self.registry_path))
+        else:
+            operations = len({payment.operation for payment in active})
+            self.registry_info.set("Registro: {} operaci{} · {} e-cheques utilizados · {}".format(
+                operations, "ón" if operations == 1 else "ones", sum(len(payment.checks) for payment in active),
+                self.registry_path))
+        if self.imported:
+            clients = len({check.client_id for check in checks})
+            total = money(sum(check.amount for check in self.available))
+            if used:
+                self.file_detail.set("{} e-cheques disponibles ({} ya utilizados) · {} clientes · Total disponible: {}".format(
+                    len(self.available), len(used), clients, total))
+            else:
+                self.file_detail.set("{} e-cheques · {} clientes · Total disponible: {}".format(len(checks), clients, total))
+        return registry
+
+    # --- LISTA DE PAGOS ---
+    def _refresh_payments(self):
+        self.payment_table.delete(*self.payment_table.get_children())
+        for number, payment in enumerate(self.payments, 1):
+            self.payment_table.insert("", "end", values=(number, payment.label, money(payment.target)))
+        self.payments_title.set("Pagos cargados ({})".format(len(self.payments)))
+
+    def _add_from_entry(self):
+        target = parse_amount(self.target.get())
+        identifier = self.clients.get(self.client.get())
+        self.payments.append(Payment(target, identifier, self.client_names.get(identifier, "")))
+        self.target.set("")
+        self._refresh_payments()
+        self._invalidate()
+
+    def add_payment(self):
+        if self.busy or not self.imported or not self.imported.checks:
+            return
+        try:
+            self._add_from_entry()
+        except DataError as exc:
+            messagebox.showwarning("Revisá el importe", str(exc))
+        self.amount_entry.focus_set()
+
+    def remove_payment(self):
+        if self.busy:
+            return
+        positions = sorted((self.payment_table.index(item) for item in self.payment_table.selection()), reverse=True)
+        if not positions:
+            self.status.set("Seleccioná en la lista el pago que querés quitar.")
+            return
+        for position in positions:
+            del self.payments[position]
+        self._refresh_payments()
+        self._invalidate()
+
+    def clear_payments(self):
+        if self.busy or not self.payments:
+            return
+        self.payments = []
+        self._refresh_payments()
+        self._invalidate()
+
+    # --- BÚSQUEDA ---
     def search(self):
         if self.busy or not self.imported or not self.imported.checks:
             return
         try:
-            target = parse_amount(self.target.get())
+            if self.target.get().strip():
+                self._add_from_entry()
+            if not self.payments:
+                raise DataError("Agregá al menos un pago: escribí el importe y presioná Agregar pago.")
             start, end = parse_date(self.date_from.get()), parse_date(self.date_to.get())
             date_field = self.date_field.get()
-            identifier = self.clients.get(self.client.get())
-            records = [check for check in self.imported.checks if identifier is None or check.client_id == identifier]
-            checks, excluded_dates = filter_checks(records, date_field, start, end)
+            registry = Registry.load(self.registry_path)
+            available, used = registry.split(self.imported.checks)
+            _, excluded_dates = filter_checks(available, date_field, start, end)
+            viable = [payment for payment in self.payments if filter_checks(
+                [check for check in available if payment.client_id in (None, check.client_id)],
+                date_field, start, end)[0]]
         except DataError as exc:
-            messagebox.showwarning("Revisá el importe y las fechas", str(exc))
+            messagebox.showwarning("Revisá los pagos, las fechas y el registro", str(exc))
             self.amount_entry.focus_set()
             return
         self._invalidate()
-        if not checks:
-            messagebox.showwarning("Sin e-cheques para esas fechas", "No hay registros que cumplan el cliente y el rango elegidos. {} tienen la fecha vacía o inválida.".format(excluded_dates))
+        if not viable:
+            reason = ("Todos los e-cheques de este listado ya figuran como utilizados en el registro."
+                      if not available else
+                      "No hay e-cheques disponibles que cumplan el cliente y el rango elegidos. "
+                      "{} tienen la fecha vacía o inválida.".format(excluded_dates))
+            messagebox.showwarning("Sin e-cheques disponibles", reason)
             return
         progressive = self.strategy.get().startswith("Progresiva")
         prefer_previous = self.prefer_previous.get()
+        payments = list(self.payments)
         self.search_context = {"date_field": date_field, "from": self.date_from.get(), "to": self.date_to.get(),
                                "excluded_dates": excluded_dates, "previous": progressive and prefer_previous}
-        self.target_total.set(money(target))
+        self.target_total.set(money(sum(payment.target for payment in payments)))
         self.cancel.clear()
         self._set_busy(True, searching=True)
-        self.status.set("Buscando la combinación más cercana sin superar {}…".format(money(target)))
+        self.status.set("Buscando la combinación más cercana sin superar {}…".format(
+            money(payments[0].target) if len(payments) == 1 else "cada pago"))
         def calculate():
             progress = lambda message: self.events.put(("progress", message))
-            if progressive:
-                return find_progressive(checks, target, self.cancel, progress, date_field, prefer_previous)
-            result = find_combination(checks, target, self.cancel, progress)
-            result.date_field = date_field
-            return result
+            return find_payments(available, payments, progressive, date_field, start, end,
+                                 prefer_previous, self.cancel, progress)
         self._worker("found", calculate)
 
     def stop(self):
@@ -729,53 +899,294 @@ class Application:
         self.cancel_button.configure(state="disabled")
         self.status.set("Terminando y recuperando una combinación válida…")
 
-    def _found(self, result):
+    def _describe(self, outcomes):
+        """Título y detalle del resultado; el caso de un solo pago conserva su texto propio."""
+        done = [outcome.result for outcome in outcomes if outcome.result is not None]
+        if len(outcomes) == 1 and done:
+            result = done[0]
+            if not result.completed:
+                return ("Búsqueda detenida · mejor combinación encontrada",
+                        "El total no supera lo solicitado. Podría existir una combinación más cercana; volvé a buscar para completar el cálculo.")
+            if result.transfer == 0:
+                return ("Coincidencia exacta",
+                        "{} e-cheques cubren todo el importe. No hace falta completar por transferencia.".format(len(result.checks)))
+            if not result.checks:
+                return ("Ningún e-cheque entra en el importe solicitado",
+                        "Los e-cheques disponibles superan el objetivo. El importe completo queda a completar por transferencia.")
+            if result.strategy == "progressive":
+                return ("Selección progresiva · de mayor a menor",
+                        "{} e-cheques elegidos por monto y tandas. Faltan {}. Otra combinación podría cubrir más.".format(
+                            len(result.checks), money(result.transfer)))
+            return ("La combinación más cercana sin pasarse",
+                    "{} e-cheques seleccionados. La diferencia a completar por transferencia es {}.".format(
+                        len(result.checks), money(result.transfer)))
+        if len(done) < len(outcomes):
+            return ("Búsqueda detenida · {} de {} pagos calculados".format(len(done), len(outcomes)),
+                    "Los pagos sin calcular no tienen e-cheques asignados y no se pueden registrar. Volvé a buscar para completar el cálculo.")
+        if not all(result.completed for result in done):
+            return ("Búsqueda detenida · mejor reparto encontrado",
+                    "Ningún pago supera su importe, pero podría existir un reparto que complete más. Se puede registrar igual.")
+        count = sum(len(result.checks) for result in done)
+        transfer = sum(result.transfer for result in done)
+        detail = "{} e-cheques distintos: ninguno se repite entre pagos. ".format(count)
+        detail += ("Todos los pagos quedan cubiertos." if not transfer else
+                   "Faltan {} por transferencia en total.".format(money(transfer)))
+        if transfer and all(result.strategy == "exact" for result in done):
+            detail += (" Es el mejor reparto posible entre los pagos." if all(result.optimal for result in done) else
+                       " No se pudo demostrar que sea el mejor reparto: se agotó el tiempo de búsqueda ({:g} s).".format(SPLIT_SECONDS))
+        return "{} pagos calculados".format(len(outcomes)), detail
+
+    def _found(self, outcomes):
         self._stop_result_animations()
         self.table.delete(*self.table.get_children())
-        self.result = result
+        self.results = outcomes
+        self.registered = False
         self._set_busy(False)
-        self.target_total.set(money(result.target))
-        self.check_total.set(money(result.total))
-        self.transfer_total.set(money(result.transfer))
-        if not result.completed:
-            title = "Búsqueda detenida · mejor combinación encontrada"
-            detail = "El total no supera lo solicitado. Podría existir una combinación más cercana; volvé a buscar para completar el cálculo."
-        elif result.transfer == 0:
-            title = "Coincidencia exacta"
-            detail = "{} e-cheques cubren todo el importe. No hace falta completar por transferencia.".format(len(result.checks))
-        elif not result.checks:
-            title = "Ningún e-cheque entra en el importe solicitado"
-            detail = "Los e-cheques disponibles superan el objetivo. El importe completo queda a completar por transferencia."
-        elif result.strategy == "progressive":
-            title = "Selección progresiva · de mayor a menor"
-            detail = "{} e-cheques elegidos por monto y tandas. Faltan {}. Otra combinación podría cubrir más.".format(len(result.checks), money(result.transfer))
-        else:
-            title = "La combinación más cercana sin pasarse"
-            detail = "{} e-cheques seleccionados. La diferencia a completar por transferencia es {}.".format(len(result.checks), money(result.transfer))
+        done = [outcome.result for outcome in outcomes if outcome.result is not None]
+        self.target_total.set(money(sum(result.target for result in done)))
+        self.check_total.set(money(sum(result.total for result in done)))
+        self.transfer_total.set(money(sum(result.transfer for result in done)))
+        title, detail = self._describe(outcomes)
         self.result_title.set(title)
         self.result_detail.set(detail)
 
+        date_field = done[0].date_field if done else self.date_field.get()
+        self.table.heading("batch", text="Tanda semanal · fecha " + date_field)
         inserted_ids = []
-        balance = result.target
-        self.table.heading("batch", text="Tanda semanal · fecha " + result.date_field)
-        for i, check in enumerate(result.checks):
-            balance -= check.amount
-            row_id = self.table.insert("", "end", values=(check.row, check.reference, check.date_f, check.date_g,
-                                                         check.client_id, check.client_name, money(check.amount), check.receipt,
-                                                         batch_label(check, result.date_field), money(balance)),
-                                       tags=("alternate",) if i % 2 else ())
-            inserted_ids.append(row_id)
+        for number, outcome in enumerate(outcomes, 1):
+            result, payment = outcome.result, outcome.payment
+            if result is None:
+                summary, total, remaining = "Sin calcular", "", ""
+            else:
+                summary = "{} e-cheque{}".format(len(result.checks), "" if len(result.checks) == 1 else "s") if result.checks else "Sin e-cheques"
+                total, remaining = money(result.total), money(result.transfer)
+            parent = self.table.insert("", "end", text="Pago {}".format(number), open=True, tags=("payment",),
+                                       values=("", summary, "", "", payment.client_id or "",
+                                               payment.client_name or ("Todos los clientes" if payment.client_id is None else ""),
+                                               total, "", "Solicitado " + money(payment.target), remaining))
+            balance = payment.target
+            for check in result.checks if result else []:
+                balance -= check.amount
+                inserted_ids.append(self.table.insert(
+                    parent, "end", values=(check.row, check.reference, check.date_f, check.date_g,
+                                           check.client_id, check.client_name, money(check.amount), check.receipt,
+                                           batch_label(check, date_field), money(balance)),
+                    tags=("alternate",) if len(inserted_ids) % 2 else ()))
 
         # Dispara la cascada y la transición de métricas
         self._animate_kpi_reveal()
         self._animate_table_rows(inserted_ids)
 
-        self.message.set(customer_message(result))
-        self.copy_button.configure(state="normal")
-        self.export_button.configure(state="normal")
-        self.status.set("{} · {:.2f} s · Fecha {} · {} registros excluidos por fecha inválida.".format(
-            "Cálculo completo" if result.completed else "Cálculo detenido", result.elapsed, result.date_field,
-            self.search_context.get("excluded_dates", 0)))
+        text = payments_message(outcomes)
+        lines = text.split("\n")
+        self.message.set(text if len(lines) <= 6 else "\n".join(lines[:6] + [
+            "… y {} pagos más. Usá Copiar mensaje para obtenerlos todos.".format(len(lines) - 6)]))
+        self._update_actions()
+        completed = all(result.completed for result in done) and len(done) == len(outcomes)
+        self.status.set("{}{} · {:.2f} s · Fecha {} · {} registros excluidos por fecha inválida.".format(
+            "" if len(outcomes) == 1 else "{} pagos · ".format(len(outcomes)),
+            "Cálculo completo" if completed else "Cálculo detenido", sum(result.elapsed for result in done),
+            date_field, self.search_context.get("excluded_dates", 0)))
+
+    # --- REGISTRO DE E-CHEQUES UTILIZADOS ---
+    def _registrable(self):
+        """Pagos con e-cheques, solo si todos los pagos de la lista tienen su cálculo."""
+        if not self.results or self.registered or any(outcome.result is None for outcome in self.results):
+            return []
+        return [outcome for outcome in self.results if outcome.result.checks]
+
+    def _update_actions(self):
+        shown = bool(self.results) and any(outcome.result is not None for outcome in self.results) and not self.busy
+        self.copy_button.configure(state="normal" if shown else "disabled")
+        self.export_button.configure(state="normal" if shown else "disabled")
+        chosen = self._registrable()
+        can_save = bool(chosen) and not self.busy
+        self.register_button.configure(state="normal" if can_save else "disabled")
+        self.operation_entry.configure(state="normal" if can_save else "disabled")
+        self.saved_button.configure(state="normal" if self.registered and not self.busy else "disabled")
+        if self.registered and self.saved_info:
+            label, payments, checks = self.saved_info
+            self.save_state.set("✔ «{}» guardada: {} pago{} y {} e-cheque{} registrados en {}. Ya no se ofrecen "
+                                "en nuevas búsquedas.".format(label, payments, "" if payments == 1 else "s",
+                                                              checks, "" if checks == 1 else "s", self.registry_path.name))
+        elif chosen:
+            count = sum(len(outcome.result.checks) for outcome in chosen)
+            self.save_state.set("Revisá el resultado y presioná «Guardar operación»: se registran estos {} e-cheque{} "
+                                "({} pago{}) y no se vuelven a ofrecer en otras búsquedas.".format(
+                                    count, "" if count == 1 else "s", len(chosen), "" if len(chosen) == 1 else "s"))
+        elif self.results and any(outcome.result is None for outcome in self.results):
+            self.save_state.set("Hay pagos sin calcular. Volvé a buscar para poder guardar la operación.")
+        elif self.results:
+            self.save_state.set("No hay e-cheques seleccionados para guardar en esta operación.")
+        else:
+            self.save_state.set("Calculá los pagos para poder guardar la operación en el registro.")
+
+    def register(self):
+        """Guarda la búsqueda como una operación: sus e-cheques dejan de ofrecerse."""
+        chosen = self._registrable()
+        if self.busy or not chosen:
+            return
+        count = sum(len(outcome.result.checks) for outcome in chosen)
+        try:
+            registry = Registry.load(self.registry_path)
+            selected = [check for outcome in chosen for check in outcome.result.checks]
+            if registry.conflicts(self.imported.checks, selected):
+                raise DataError("Alguno de estos e-cheques ya figura como utilizado en el registro (¿otra ventana o "
+                                "PC?). No se guardó nada: volvé a buscar para obtener una selección actualizada.")
+            added = registry.add(chosen, Path(self.path).name, self.imported.sheet, name=self.operation_name.get())
+            registry.save()
+        except (DataError, OSError) as exc:
+            messagebox.showerror("No se pudo guardar la operación", str(exc))
+            return
+        operation = registry.operations()[-1]
+        self.registered = True
+        self.saved_operation = operation.id
+        self.saved_info = (operation.label, len(added), count)
+        self.payments = []  # lo guardado ya no es una lista pendiente: no puede recalcularse por error
+        self._refresh_payments()
+        self._refresh_availability()
+        self._update_actions()
+        self.result_detail.set("Guardada como «{}». Sus e-cheques ya no se ofrecen en nuevas búsquedas.".format(operation.label))
+        self.status.set("Operación guardada en {}. Podés copiar el mensaje o exportar antes de cargar nuevos pagos.".format(
+            self.registry_path))
+
+    def show_saved(self):
+        if self.saved_operation is not None:
+            self.show_registry(select=self.saved_operation)
+
+    def show_registry(self, select=None):
+        """Operaciones guardadas: se hace clic en una para ver sus pagos y e-cheques."""
+        if self.busy:
+            return
+        try:
+            registry = Registry.load(self.registry_path)
+        except DataError as exc:
+            messagebox.showerror("No se pudo leer el registro", str(exc))
+            return
+        window = tk.Toplevel(self.root)
+        window.title("Registro de operaciones")
+        window.geometry("1000x680")
+        window.configure(bg=BG_PANEL, padx=14, pady=12)
+        window.transient(self.root)
+        tk.Label(window, text="Archivo: {}".format(self.registry_path), bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=(self.FONT_FAMILY, 8), anchor="w").pack(fill="x")
+
+        buttons = tk.Frame(window, bg=BG_PANEL)
+        buttons.pack(side="bottom", fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="Cerrar", command=window.destroy).pack(side="right")
+        ttk.Button(buttons, text="Anular selección", command=lambda: void(),
+                   style="Danger.TButton").pack(side="right", padx=(0, 8))
+        tk.Label(buttons, text="Seleccioná una operación (o uno de sus pagos) para ver sus e-cheques o anularla.",
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=(self.FONT_FAMILY, 8)).pack(side="left")
+
+        def tree(columns, headings, widths, height, tree_title=None):
+            frame = tk.Frame(window, bg=BG_PANEL)
+            frame.pack(fill="both", expand=True, pady=(6, 0))
+            view = ttk.Treeview(frame, columns=columns, show="tree headings" if tree_title else "headings",
+                                height=height, style="Payments.Treeview")
+            if tree_title:
+                view.heading("#0", text=tree_title)
+                view.column("#0", width=360, minwidth=160, anchor="w")
+            for col, title, width in zip(columns, headings, widths):
+                view.heading(col, text=title)
+                view.column(col, width=width, minwidth=40, anchor="e" if title in ("Importe", "Total", "Solicitado") else "w")
+            scroll = ttk.Scrollbar(frame, orient="vertical", command=view.yview)
+            view.configure(yscrollcommand=scroll.set)
+            view.pack(side="left", fill="both", expand=True)
+            scroll.pack(side="left", fill="y")
+            return view
+
+        operations_view = tree(("date", "client", "target", "count", "total", "state"),
+                               ("Registrada", "Cliente", "Solicitado", "E-cheques", "Total", "Estado"),
+                               (125, 110, 110, 95, 110, 150), 7, "Operación / pago")
+        detail = tk.StringVar(value="Sin selección.")
+        tk.Label(window, textvariable=detail, bg=BG_PANEL, fg=TEXT_MID, font=(self.FONT_FAMILY, 9), anchor="w",
+                 justify="left", wraplength=940).pack(fill="x", pady=(10, 0))
+        checks_view = tree(("reference", "date_f", "date_g", "id", "name", "amount", "receipt"),
+                           ("Referencia", "Fecha F", "Fecha G", "ID Cliente", "Cliente", "Importe", "Recibo"),
+                           (110, 90, 90, 80, 200, 120, 110), 6)
+        state = {"registry": registry}
+
+        def fill(keep=None):
+            operations_view.delete(*operations_view.get_children())
+            checks_view.delete(*checks_view.get_children())
+            operations = list(reversed(state["registry"].operations()))
+            for position, operation in enumerate(operations):
+                parent = operations_view.insert(
+                    "", "end", iid="op{}".format(operation.id), open=position == 0 or operation.id == select,
+                    text="#{} · {}".format(operation.id, operation.label),
+                    values=(format_timestamp(operation.registered), "{} pago{}".format(
+                        len(operation.payments), "" if len(operation.payments) == 1 else "s"),
+                        money(operation.target), len(operation.checks), money(operation.total), operation.status))
+                for payment in operation.payments:
+                    operations_view.insert(
+                        parent, "end", iid="pay{}".format(payment.id), text="Pago {}".format(payment.id),
+                        values=("", "Todos los clientes" if payment.client_id is None else payment.client_id,
+                                money(payment.target), len(payment.checks), money(payment.total),
+                                "Anulado " + format_timestamp(payment.voided) if payment.voided else "Registrado"))
+            wanted = keep or ("op{}".format(select) if select is not None else None)
+            if wanted and operations_view.exists(wanted):
+                operations_view.selection_set(wanted)
+                operations_view.see(wanted)
+
+        def selected():
+            """('op'|'pay', número, pagos de la selección) o None."""
+            chosen = operations_view.selection()
+            if not chosen:
+                return None
+            kind, number = ("op", int(chosen[0][2:])) if chosen[0].startswith("op") else ("pay", int(chosen[0][3:]))
+            members = [payment for payment in state["registry"].payments
+                       if (payment.operation if kind == "op" else payment.id) == number]
+            return (kind, number, members) if members else None
+
+        def show_checks(event=None):
+            checks_view.delete(*checks_view.get_children())
+            current = selected()
+            if current is None:
+                detail.set("Sin selección.")
+                return
+            kind, number, members = current
+            first = members[0]
+            if kind == "op":
+                operation = next(op for op in state["registry"].operations() if op.id == number)
+                detail.set("Operación {} · «{}» · registrada el {} · archivo {} (hoja {}) · {} pago{} · {}".format(
+                    number, operation.label, format_timestamp(first.registered), first.file, first.sheet,
+                    len(members), "" if len(members) == 1 else "s", operation.status))
+            else:
+                detail.set("Pago {} de la operación {} · solicitado {} · e-cheques {} · a completar por transferencia {}".format(
+                    number, first.operation, money(first.target), money(first.total), money(first.transfer)))
+            for payment in members:
+                for check in payment.checks:
+                    checks_view.insert("", "end", values=(check.reference, check.date_f, check.date_g, check.client_id,
+                                                          check.client_name, money(check.amount), check.receipt))
+
+        def void():
+            current = selected()
+            if current is None:
+                messagebox.showinfo("Anular", "Seleccioná primero la operación o el pago que querés anular.", parent=window)
+                return
+            kind, number, members = current
+            what = "la operación {}".format(number) if kind == "op" else "el pago {}".format(number)
+            if not messagebox.askyesno("Anular", "Los e-cheques de {} volverán a estar disponibles. "
+                                       "Queda en el historial como anulada.".format(what), parent=window):
+                return
+            try:
+                fresh = Registry.load(self.registry_path)
+                fresh.void_operation(number) if kind == "op" else fresh.void(number)
+                fresh.save()
+            except (DataError, OSError) as exc:
+                messagebox.showerror("No se pudo anular", str(exc), parent=window)
+                return
+            state["registry"] = fresh
+            self._refresh_availability()
+            fill(keep=operations_view.selection()[0] if operations_view.selection() else None)
+            show_checks()
+            self.status.set("Se anuló {}: sus e-cheques están disponibles otra vez.".format(what))
+
+        operations_view.bind("<<TreeviewSelect>>", show_checks)
+        window.bind("<Escape>", lambda event: window.destroy())
+        fill()
+        show_checks()
 
     def _poll(self):
         self.root.after_cancel(self.poll_timer)
@@ -830,14 +1241,14 @@ class Application:
         text.configure(state="disabled")
 
     def copy_message(self):
-        if self.result is None:
+        if not self.results:
             return
         self.root.clipboard_clear()
-        self.root.clipboard_append(customer_message(self.result))
+        self.root.clipboard_append(payments_message(self.results))
         self.status.set("Mensaje copiado al portapapeles. Listo para enviar al cliente.")
 
     def export(self):
-        if self.result is None:
+        if not self.results:
             return
         path = filedialog.asksaveasfilename(title="Guardar selección", defaultextension=".csv",
                                             initialfile="seleccion_echeques.csv", filetypes=[("CSV para Excel", "*.csv")])
@@ -850,29 +1261,44 @@ class Application:
             return text
         def decimal(cents):
             return "{},{:02d}".format(cents // 100, cents % 100)
+        done = [outcome.result for outcome in self.results if outcome.result is not None]
+        completed = len(done) == len(self.results) and all(result.completed for result in done)
+        date_field = done[0].date_field
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as handle:
                 writer = csv.writer(handle, delimiter=";")
                 writer.writerow(["Archivo", safe(Path(self.path).name)])
                 writer.writerow(["Hoja", safe(self.imported.sheet)])
-                state = ("Búsqueda detenida; óptimo no confirmado" if not self.result.completed else
-                         "Selección progresiva" if self.result.strategy == "progressive" else "Óptimo confirmado")
+                state = ("Búsqueda detenida; óptimo no confirmado" if not completed else
+                         "Selección progresiva" if done[0].strategy == "progressive" else
+                         "Óptimo confirmado" if all(result.optimal for result in done) else
+                         "Reparto no demostrado como el mejor (tiempo agotado)")
                 writer.writerow(["Estado", state])
-                writer.writerow(["Fecha usada", self.result.date_field])
+                writer.writerow(["Registrado como utilizado", "Sí" if self.registered else "No"])
+                if self.registered and self.saved_info:
+                    writer.writerow(["Operación guardada", safe("#{} · {}".format(self.saved_operation, self.saved_info[0]))])
+                writer.writerow(["Fecha usada", date_field])
                 writer.writerow(["Desde", safe(self.search_context.get("from", ""))])
                 writer.writerow(["Hasta", safe(self.search_context.get("to", ""))])
                 writer.writerow(["Priorizar semanas anteriores", "Sí" if self.search_context.get("previous") else "No"])
-                writer.writerow(["Importe solicitado", decimal(self.result.target)])
-                writer.writerow(["Total e-cheques", decimal(self.result.total)])
-                writer.writerow(["A completar por transferencia", decimal(self.result.transfer)])
+                writer.writerow(["Importe solicitado", decimal(sum(result.target for result in done))])
+                writer.writerow(["Total e-cheques", decimal(sum(result.total for result in done))])
+                writer.writerow(["A completar por transferencia", decimal(sum(result.transfer for result in done))])
                 writer.writerow([])
-                writer.writerow(["Fila Excel", "Referencia C", "Fecha F", "Fecha G", "ID cliente", "Cliente", "Importe", "Recibo", "Orden", "Tanda semanal", "Saldo restante"])
-                balance = self.result.target
-                for order, check in enumerate(self.result.checks, 1):
-                    balance -= check.amount
-                    writer.writerow([check.row, "'" + check.reference, safe(check.date_f), safe(check.date_g),
-                                     "'" + check.client_id, safe(check.client_name), decimal(check.amount), safe(check.receipt),
-                                     order, batch_label(check, self.result.date_field), decimal(balance)])
+                writer.writerow(["Pago", "Cliente", "Importe solicitado", "Total e-cheques", "A completar por transferencia"])
+                for number, outcome in enumerate(self.results, 1):
+                    result = outcome.result
+                    writer.writerow([number, safe(outcome.payment.label), decimal(outcome.payment.target)] +
+                                    ([decimal(result.total), decimal(result.transfer)] if result else ["sin calcular", ""]))
+                writer.writerow([])
+                writer.writerow(["Pago", "Fila Excel", "Referencia C", "Fecha F", "Fecha G", "ID cliente", "Cliente", "Importe", "Recibo", "Orden", "Tanda semanal", "Saldo restante"])
+                for number, outcome in enumerate(self.results, 1):
+                    balance = outcome.payment.target
+                    for order, check in enumerate(outcome.result.checks if outcome.result else [], 1):
+                        balance -= check.amount
+                        writer.writerow([number, check.row, "'" + check.reference, safe(check.date_f), safe(check.date_g),
+                                         "'" + check.client_id, safe(check.client_name), decimal(check.amount), safe(check.receipt),
+                                         order, batch_label(check, date_field), decimal(balance)])
             self.status.set("Selección exportada en {}.".format(path))
         except OSError as exc:
             messagebox.showerror("No se pudo guardar", str(exc))
@@ -889,14 +1315,30 @@ class Application:
 def _self_test(destination):
     """Verificación automática del ejecutable distribuido, sin mostrar ventanas."""
     import json
+    import tempfile
     import time
     from core import Check, ImportResult
     root = tk.Tk()
     root.withdraw()
     callback_errors = []
     root.report_callback_exception = lambda kind, error, trace: callback_errors.append(str(error))
-    app = Application(root)
+    scratch = tempfile.TemporaryDirectory()  # el registro real del usuario nunca se toca
+    registry_file = Path(scratch.name) / "registro_prueba.json"
+    app = Application(root, registry_file)
+    confirm = messagebox.askyesno
+    messagebox.askyesno = lambda *args, **kwargs: True
     report = {"ok": False}
+
+    def wait():
+        deadline = time.monotonic() + 15
+        while app.busy and time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
+
+    def shown(index=0):
+        parent = app.table.get_children()[index]
+        return app.table.get_children(parent)
+
     try:
         records = [Check(i + 2, "DEMO-{}".format(i), "01/09/2025", "50/09/2025", "00123",
                          "Cliente de prueba", amount, "Recibo de prueba")
@@ -904,13 +1346,10 @@ def _self_test(destination):
         app._loaded(("prueba.xlsx", ["Pagos"], ImportResult(records, [], [], "Pagos")))
         app.target.set("500.000")
         app.search()
-        deadline = time.monotonic() + 15
-        while app.busy and time.monotonic() < deadline:
-            root.update()
-            time.sleep(0.01)
-        result = app.result
+        wait()
+        result = app.results[0].result if app.results else None
         report = {"ok": not callback_errors and result is not None and result.optimal and result.total == 45000000
-                        and result.transfer == 5000000 and len(app.table.get_children()) == 2,
+                        and result.transfer == 5000000 and len(shown()) == 2,
                   "total_cents": result.total if result else None,
                   "transfer_cents": result.transfer if result else None,
                   "tk": root.tk.call("info", "patchlevel"), "frozen": bool(getattr(sys, "frozen", False)),
@@ -921,25 +1360,43 @@ def _self_test(destination):
         app._loaded(("prueba.xlsx",["Pagos"],ImportResult(dated,[],[],"Pagos")))
         app.target.set("1.000.000")
         app.search()
-        deadline = time.monotonic() + 15
-        while app.busy and time.monotonic() < deadline:
-            root.update()
-            time.sleep(0.01)
-        report["weekly_selection"] = bool(app.result and [c.amount for c in app.result.checks] == [90000000,6000000,4000000])
+        wait()
+        report["weekly_selection"] = bool(app.results and [c.amount for c in app.results[0].result.checks] == [90000000,6000000,4000000])
         app.date_from.set("14/09/2026")
         app.date_to.set("14/09/2026")
         app.search()
-        deadline = time.monotonic() + 15
-        while app.busy and time.monotonic() < deadline:
-            root.update()
-            time.sleep(0.01)
-        report["date_filter"] = bool(app.result and app.result.total == 6000000 and len(app.result.checks) == 1)
-        report["ok"] = report["ok"] and report["weekly_selection"] and report["date_filter"] and not callback_errors
+        wait()
+        report["date_filter"] = bool(app.results and app.results[0].result.total == 6000000 and len(app.results[0].result.checks) == 1)
+        app.date_from.set("")
+        app.date_to.set("")
+
+        # Varios pagos: ningún e-cheque se repite; al registrar quedan fuera de nuevas búsquedas.
+        several = [Check(i + 2, "MULTI-{}".format(i), "01/09/2026", "02/09/2026", "00123", "Demo", amount, "")
+                   for i, amount in enumerate((50000000, 40000000, 30000000, 20000000))]
+        app._loaded(("prueba.xlsx", ["Pagos"], ImportResult(several, [], [], "Pagos")))
+        for _ in range(3):
+            app.target.set("500.000")
+            app.add_payment()
+        app.search()
+        wait()
+        chosen = [[c.amount for c in outcome.result.checks] for outcome in app.results] if app.results else []
+        rows = [c.row for outcome in app.results for c in outcome.result.checks] if app.results else []
+        report["multi_payment"] = bool(chosen == [[50000000], [40000000], [30000000, 20000000]]
+                                       and len(rows) == len(set(rows)))
+        app.register()
+        from registro import Registry
+        saved = Registry.load(registry_file)
+        report["registry"] = bool(len(saved.payments) == 3 and saved.split(several)[0] == []
+                                  and app.registered and app.available == [] and not app.payments)
+        report["ok"] = (report["ok"] and report["weekly_selection"] and report["date_filter"]
+                        and report["multi_payment"] and report["registry"] and not callback_errors)
     except Exception as exc:
         report["error"] = str(exc)
     finally:
+        messagebox.askyesno = confirm
         root.update_idletasks()
         app.close()
+        scratch.cleanup()
         Path(destination).write_text(json.dumps(report, indent=2), encoding="utf-8")
     return 0 if report["ok"] else 1
 

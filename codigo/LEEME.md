@@ -2,7 +2,9 @@
 
 Aplicación de escritorio para seleccionar e-cheques por importe y tandas de
 fecha **sin superar el monto solicitado**. Muestra el faltante que se
-debe completar por transferencia. Trabaja localmente, sin cuentas ni conexión.
+debe completar por transferencia. Permite cargar **varios pagos a la vez**
+y lleva un **registro (JSON) de los e-cheques ya utilizados** para no volver a
+usarlos. Trabaja localmente, sin cuentas ni conexión.
 
 ## Uso en Windows
 
@@ -10,8 +12,11 @@ debe completar por transferencia. Trabaja localmente, sin cuentas ni conexión.
    extraelo primero. El ejecutable incluye Python.
 2. Presioná **Abrir Excel** y seleccioná el archivo `.xlsx`.
 3. Si el libro tiene varias hojas, elegí la que contiene los pagos.
-4. Ingresá el importe: `500.000`, `500000` o `500.000,50`.
-5. Dejá **Todos los clientes** para combinar todo el listado, o elegí un cliente.
+4. Ingresá el importe del pago: `500.000`, `500000` o `500.000,50`, y presioná
+   **Agregar pago** (o Enter). Para **varios pagos**, repetí este paso: quedan en
+   la lista **Pagos cargados**, que se corrige con **Quitar seleccionado** o **Vaciar**.
+5. Antes de agregar cada pago, dejá **Todos los clientes** para combinar todo el
+   listado, o elegí un cliente: cada pago tiene el suyo.
 6. Elegí **Fecha F** o **Fecha G** según la columna del Excel que corresponda.
    Por defecto se usa G; el archivo no identifica cuál es emisión o vencimiento.
 7. Elegí **Desde** y **Hasta** con los calendarios `…`, o escribí `dd/mm/aaaa`.
@@ -19,14 +24,71 @@ debe completar por transferencia. Trabaja localmente, sin cuentas ni conexión.
    Vacío significa sin límite; **Limpiar fechas** quita ambos límites.
 8. Dejá **Progresiva · mayor a menor** y, si lo deseás, activá
    **Priorizar la tanda de una semana anterior**.
-9. Presioná **Buscar combinación**.
+9. Presioná **Buscar combinación**. Si dejaste un importe escrito sin agregar,
+   se suma como último pago. Con un solo pago alcanza con escribir el importe y buscar.
+10. Revisá el resultado. Debajo de los totales está la barra **3. GUARDAR OPERACIÓN**
+    (siempre visible; se habilita al calcular). Escribí, si querés, un **nombre** para
+    identificarla y presioná **Guardar operación**: esos e-cheques quedan registrados como
+    utilizados (ver más abajo). Buscar solo calcula: no guarda nada.
 
-El resultado muestra el importe solicitado, el total seleccionado, el faltante
-por transferencia y el detalle de cada e-cheque, en el orden de selección.
-La tabla muestra la tanda semanal y el saldo restante después de cada cheque.
-**Copiar mensaje** prepara
-el texto para pegarlo donde corresponda; el programa no envía mensajes.
-**Exportar CSV** guarda la selección y los totales para abrirlos en Excel.
+El resultado muestra, por cada pago, el importe solicitado, el total seleccionado,
+el faltante por transferencia y el detalle de cada e-cheque, en el orden de selección.
+Arriba se suman los totales de todos los pagos. La tabla muestra la tanda semanal y
+el saldo restante después de cada cheque. **Copiar mensaje** prepara
+el texto para pegarlo donde corresponda (una línea por pago); el programa no envía
+mensajes. **Exportar CSV** guarda los pagos, la selección y los totales para abrirlos en Excel.
+
+## Varios pagos y registro de e-cheques utilizados
+
+**Varios pagos.** Se calculan en el orden de la lista. Un pago puede usar un
+e-cheque o varios, pero **un e-cheque elegido para un pago no se ofrece a los
+siguientes**. El cliente, las fechas y el criterio se aplican a cada pago sobre lo
+que quedó libre. En la **Progresiva** el orden importa: el primer pago elige antes
+que los demás. Con **Mejor suma posible** y varios pagos, el programa además
+**reparte los e-cheques entre todos los pagos**: busca el menor faltante total y, a
+igual faltante, que se completen exactamente más pagos (ningún pago supera su importe).
+Primero calcula un pago tras otro; si eso ya completa todos, o ya cubre lo máximo que
+cada pago lograría por separado, termina ahí. Si no, busca un reparto mejor durante
+hasta 10 segundos; si no llega a demostrar que es el mejor, lo informa («No se pudo
+demostrar que sea el mejor reparto») y lo marca así en el CSV. Con un solo pago, o con
+la Progresiva, no hay reparto. Si detenés una búsqueda con varios pagos, los pagos
+que no llegaron a calcularse figuran como **Sin calcular** y no se puede registrar el lote;
+si la detenés durante el reparto, se conserva el mejor reparto hallado y sí se puede registrar.
+
+**Registro.** Una **operación** es una búsqueda con todos sus pagos. Al presionar
+**Guardar operación** (un solo clic), los e-cheques elegidos se guardan en
+`registro_echeques.json`, junto a `eCheck.exe`, siempre en ese JSON local. El archivo
+se crea al guardar la primera operación y es legible: por cada pago guarda número de
+operación, el nombre que le pusiste (o «Operación N»), fecha y hora, archivo y hoja de
+origen, cliente (si filtraste), importe solicitado, total, faltante y los datos de cada e-cheque. Los importes figuran como
+texto con dos decimales (`"500000.00"`). Desde ese momento esos e-cheques **no se
+vuelven a ofrecer**, tampoco al cerrar el programa ni al cargar otro Excel.
+
+- Un e-cheque se reconoce por su **referencia (C), cliente, importe y fechas F y G**;
+  no por el número de fila ni por el recibo. Por eso sigue bloqueado aunque el Excel
+  nuevo traiga las filas en otro orden. Si hay varios registros idénticos en todo eso,
+  se descuentan tantos como veces se usaron.
+- **Registro…** (o **Ver en el registro**, que abre la operación recién guardada)
+  lista las operaciones con su número, nombre, fecha, cantidad de pagos y e-cheques,
+  total y estado. Al hacer clic en una operación se ven todos sus e-cheques; se
+  despliega para ver sus pagos y al hacer clic en un pago, los suyos. **Anular selección**
+  devuelve a la lista de disponibles los e-cheques de la operación (o del pago) elegido;
+  queda en el historial marcada como anulada. Es la forma de corregir una operación guardada
+  por error: no hay confirmación al guardar porque siempre se puede anular.
+- Después de guardar, la lista de pagos se vacía (no se pueden recalcular por error),
+  pero el resultado sigue en pantalla para copiar el mensaje o exportar; el CSV indica
+  la operación guardada.
+- Si el archivo de registro está dañado o fue editado a mano con un formato inválido,
+  el programa **no busca** y no lo sobrescribe: avisa cuál es el archivo para que lo
+  corrijas o lo muevas. Así nunca se reutilizan e-cheques sin aviso.
+- **Al actualizar el programa** (extraer un ZIP nuevo en otra carpeta), copiá
+  `registro_echeques.json` junto al nuevo `eCheck.exe`. Si la carpeta no lo tiene, el
+  programa muestra «Registro nuevo» y no tendrá en cuenta lo usado antes. Los registros
+  creados con versiones anteriores se siguen leyendo. Conviene
+  hacer copia del archivo de vez en cuando.
+- Cada instalación lleva su propio registro. Si varias personas comparten el archivo
+  (por ejemplo desde una carpeta de red), que no registren al mismo tiempo. Al
+  registrar se comprueba que los e-cheques no hayan sido tomados mientras tanto.
 
 Ejemplo: para cubrir $ 500.000,00, si la mejor combinación es $ 450.000,00,
 el programa informa $ 50.000,00 a completar por transferencia.
@@ -96,16 +158,17 @@ Excel y se deja una observación; guardá el libro recalculado antes de importar
 No se admiten archivos `.xls`, archivos protegidos con contraseña ni importes
 reales con más de dos decimales. Máximo: 20.000 registros por hoja.
 
-Cada fila se usa como máximo una vez en una búsqueda. Registros con iguales
-fechas, cliente e importe se conservan como cheques separados. La selección
-se hace sobre la hoja, el cliente y el rango de fechas elegidos. Cambiar el
-importe, cliente, fechas o criterio invalida el resultado anterior para evitar
-copiar o exportar una selección desactualizada. Al cargar otro archivo u hoja
-se limpian los límites de fecha.
+Cada fila se usa como máximo una vez en una búsqueda, y no se repite entre los
+pagos de la misma búsqueda. Registros con iguales fechas, cliente e importe se
+conservan como cheques separados. La selección se hace sobre la hoja, el cliente
+y el rango de fechas elegidos, entre los e-cheques que el registro no marca como
+utilizados. Cambiar las fechas, el criterio o la lista de pagos invalida el
+resultado anterior para evitar copiar o exportar una selección desactualizada;
+escribir el importe del próximo pago no lo invalida. Al cargar otro archivo u hoja
+se limpian los límites de fecha y la lista de pagos.
 
-Esta primera versión no lleva un historial de cheques utilizados: las búsquedas
-son independientes. Cargá un listado de cheques disponibles para cada operación.
 El Excel original no se modifica y los datos no se envían a servicios externos.
+El único archivo que el programa escribe por su cuenta es `registro_echeques.json`.
 
 ## Ejecutar desde el código fuente
 
@@ -120,12 +183,12 @@ En el ZIP de entrega, estos archivos están en la carpeta `codigo`.
 La aplicación no necesita paquetes adicionales. Para correr las pruebas:
 
 ```powershell
-py -3 -m unittest -v test_core test_app
+py -3 -m unittest -v test_core test_registro test_app
 ```
 
 ## Volver a compilar el ejecutable y el ZIP
 
-Después de guardar los cambios en `app.py` o `core.py`, cerrá el programa
+Después de guardar los cambios en `app.py`, `core.py` o `registro.py`, cerrá el programa
 eCheck y hacé doble clic en **`Compilar.cmd`**. Mantené abierta la consola
 hasta que aparezca **LISTO**.
 
@@ -137,7 +200,8 @@ el ejecutable funcione y genera estos archivos:
 
 El ZIP también incluye el código actual y los archivos para volver a compilar,
 dentro de `codigo`. No incluye los Excel de pagos. Si hay un error en las
-pruebas o la compilación, se conserva el ZIP anterior.
+pruebas o la compilación, se conserva el ZIP anterior. Ni el registro ni los Excel
+van dentro del ZIP.
 
 En esta PC el entorno de compilación ya está preparado. En otra PC, necesitás
 Python de 64 bits con Tcl/Tk; la primera compilación descarga PyInstaller.
