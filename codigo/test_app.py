@@ -251,6 +251,33 @@ class MultiplePaymentsTests(AppCase):
         self.assertEqual(self.app.result_title.get(), "3 pagos calculados")
         self.assertIn("Pago 3", self.app.message.get())
 
+    def test_best_sum_splits_checks_across_payments_to_complete_more_of_them(self):
+        self.load(checks_for([600, 900, 900, 200, 400]))
+        self.app.strategy.set("Mejor suma posible")
+        for amount in ("12", "11", "10"):
+            self.add(amount)
+        self.app.search()
+        self.wait_for_search()
+        self.assertEqual(sum(o.result.transfer == 0 for o in self.app.results), 2)
+        self.assertIn("mejor reparto posible", self.app.result_detail.get())
+        rows = [c.row for o in self.app.results for c in o.result.checks]
+        self.assertEqual(len(rows), len(set(rows)))
+        self.assertEqual(str(self.app.register_button.cget("state")), "normal")
+
+    def test_csv_does_not_call_an_unproven_split_optimal(self):
+        result = replace(find_combination(self.checks, 55000000), optimal=False)
+        self.assertGreater(result.transfer, 0)
+        self.app._found([PaymentOutcome(Payment(55000000), result), PaymentOutcome(Payment(55000000), result)])
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "seleccion.csv"
+            with patch("app.filedialog.asksaveasfilename", return_value=str(path)):
+                self.app.export()
+            with path.open(encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.reader(handle, delimiter=";"))
+        self.assertIn(["Estado", "Reparto no demostrado como el mejor (tiempo agotado)"], rows)
+        self.assertNotIn(["Estado", "Óptimo confirmado"], rows)
+        self.assertIn("No se pudo demostrar", self.app.result_detail.get())
+
     def test_pending_amount_in_the_field_is_added_when_searching(self):
         self.add("500.000")
         self.app.target.set("400.000")

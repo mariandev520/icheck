@@ -13,6 +13,9 @@ from typing import Callable, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
 
+SPLIT_SECONDS = 10.0  # tiempo máximo para repartir e-cheques entre varios pagos
+
+
 class DataError(ValueError):
     pass
 
@@ -525,15 +528,115 @@ def find_combination(checks: List[Check], target: int, cancel=None,
     return from_mask(best_mask, True)
 
 
+def _split_search(items, targets, ceilings, seed, cancel, progress, deadline):
+    """Reparto exacto de e-cheques entre pagos por ramificación y poda.
+
+    items: [(importe, pagos admitidos)] en orden descendente. ceilings[j]: lo máximo
+    que el pago j puede sumar aun solo (cota). seed: pago asignado a cada item (-1: ninguno).
+    Maximiza el total cubierto y, a igual total, la cantidad de pagos exactos.
+    Devuelve (asignación, estado): "proven", "cancelled" o "timeout".
+    """
+    k, n = len(targets), len(items)
+    amt = [item[0] for item in items]
+    opts = [item[1] for item in items]
+    reach = [[0] * (n + 1) for _ in range(k)]
+    total_reach = [0] * (n + 1)
+    for t in range(n - 1, -1, -1):
+        total_reach[t] = total_reach[t + 1] + amt[t]
+        for j in range(k):
+            reach[j][t] = reach[j][t + 1] + (amt[t] if j in opts[t] else 0)
+    can_be_exact = [ceilings[j] == targets[j] for j in range(k)]
+    cap = list(ceilings)
+    covered = 0
+    chosen = [-2] * n
+    best = list(seed)
+    best_cov = sum(a for a, j in zip(amt, seed) if j >= 0)
+    sums = [0] * k
+    for a, j in zip(amt, seed):
+        if j >= 0:
+            sums[j] += a
+    best_ex = sum(1 for j in range(k) if can_be_exact[j] and sums[j] == targets[j])
+    ceiling_total = sum(ceilings)
+    perfect = (ceiling_total, sum(can_be_exact))
+
+    def bound(t):
+        room, possible = 0, 0
+        for j in range(k):
+            r = reach[j][t]
+            room += cap[j] if cap[j] < r else r
+            if can_be_exact[j] and cap[j] <= r:
+                possible += 1
+        return covered + min(room, total_reach[t]), possible
+
+    state = {"best_cov": best_cov, "best_ex": best_ex, "done": False}
+
+    def make(t):
+        if state["done"]:
+            return []
+        total, possible = bound(t)
+        if total < state["best_cov"] or (total == state["best_cov"] and possible <= state["best_ex"]):
+            return []
+        if t == n:
+            exact = sum(1 for j in range(k) if can_be_exact[j] and cap[j] == 0)
+            if (covered, exact) > (state["best_cov"], state["best_ex"]):
+                state["best_cov"], state["best_ex"] = covered, exact
+                best[:] = chosen
+                if (covered, exact) >= perfect:
+                    state["done"] = True
+            return []
+        floor = -1
+        if t and amt[t] == amt[t - 1] and opts[t] == opts[t - 1]:
+            floor = k if chosen[t - 1] == -1 else chosen[t - 1]  # iguales: se usan en orden
+        fits = sorted((j for j in opts[t] if cap[j] >= amt[t] and j >= floor), key=lambda j: cap[j])
+        return [-1] + fits[::-1]
+
+    options = [None] * (n + 1)
+    options[0] = make(0)
+    t, steps, last_report, status = 0, 0, time.monotonic(), "proven"
+    while t >= 0 and not state["done"]:
+        steps += 1
+        if steps % 512 == 0:
+            now = time.monotonic()
+            if cancel is not None and cancel.is_set():
+                status = "cancelled"
+                break
+            if now > deadline:
+                status = "timeout"
+                break
+            if progress and now - last_report >= 0.2:
+                progress("Repartiendo entre los pagos… faltante total hasta ahora: {}.".format(
+                    money(sum(targets) - state["best_cov"])))
+                last_report = now
+        if not options[t]:
+            t -= 1
+            if t >= 0 and chosen[t] >= 0:
+                cap[chosen[t]] += amt[t]
+                covered -= amt[t]
+            continue
+        j = options[t].pop()
+        chosen[t] = j
+        if j >= 0:
+            cap[j] -= amt[t]
+            covered += amt[t]
+        t += 1
+        options[t] = make(t)
+    return best, status
+
+
 def find_payments(checks: List[Check], payments: List[Payment], progressive: bool = True,
                   date_field: str = "G", start: Optional[date] = None, end: Optional[date] = None,
                   prefer_previous: bool = True, cancel=None,
-                  progress: Optional[Callable[[str], None]] = None) -> List[PaymentOutcome]:
+                  progress: Optional[Callable[[str], None]] = None,
+                  split_seconds: float = SPLIT_SECONDS) -> List[PaymentOutcome]:
     """Calcula los pagos en el orden dado; un e-cheque elegido no se ofrece a los siguientes.
 
     Cada pago aplica su cliente y el rango de fechas sobre lo que quedó libre.
     Si se cancela, el pago en curso conserva una selección válida y los
     siguientes quedan sin calcular (result None).
+
+    Con "mejor suma" y varios pagos, además, se busca el reparto entre todos que deje
+    el menor faltante total y complete más pagos exactos (split_seconds limita esa
+    búsqueda; si se agota, se informa que no se demostró que sea el mejor).
     """
     pool = list(checks)
     outcomes = []
@@ -554,7 +657,78 @@ def find_payments(checks: List[Check], payments: List[Payment], progressive: boo
         taken = {check.row for check in result.checks}
         pool = [c for c in pool if c.row not in taken]
         outcomes.append(PaymentOutcome(payment, result))
-    return outcomes
+    if (progressive or len(payments) < 2 or any(o.result is None or not o.result.completed for o in outcomes)
+            or all(o.result.transfer == 0 for o in outcomes)):
+        return outcomes
+    return _split_between_payments(checks, payments, outcomes, date_field, start, end,
+                                   cancel, progress, split_seconds)
+
+
+class _Budget:
+    """Evento de cancelación que además vence al agotarse el tiempo del reparto."""
+
+    def __init__(self, cancel, deadline):
+        self.cancel, self.deadline = cancel, deadline
+
+    def is_set(self):
+        return (self.cancel is not None and self.cancel.is_set()) or time.monotonic() > self.deadline
+
+
+def _split_between_payments(checks, payments, outcomes, date_field, start, end, cancel, progress, split_seconds):
+    started = time.monotonic()
+    budget = _Budget(cancel, started + split_seconds)
+    eligible = []
+    for payment in payments:
+        records = [c for c in checks if payment.client_id is None or c.client_id == payment.client_id]
+        eligible.append(filter_checks(records, date_field, start, end)[0])
+    # Cota: nadie puede sumar más de lo que lograría solo con todos los e-cheques de su cliente.
+    ceilings = []
+    for j, payment in enumerate(payments):
+        if j == 0:  # el primer pago ya se calculó solo, sobre todos los e-cheques
+            ceilings.append(outcomes[0].result.total)
+            continue
+        solo = find_combination(eligible[j], payment.target, budget,
+                                (lambda m, n=j + 1: progress("Cota del pago {} · {}".format(n, m))) if progress else None)
+        if not solo.completed:  # sin cotas no se puede demostrar nada: queda el cálculo secuencial
+            return _rebuild(checks, payments, outcomes, {c.row: j for j, o in enumerate(outcomes)
+                                                         for c in o.result.checks},
+                            False, bool(cancel is not None and cancel.is_set()), date_field, started)
+        ceilings.append(solo.total)
+    baseline = sum(o.result.total for o in outcomes)
+    exact_now = sum(1 for o, c, p in zip(outcomes, ceilings, payments) if c == p.target and o.result.total == c)
+    unreachable = (baseline == sum(ceilings)
+                   and exact_now == sum(1 for c, p in zip(ceilings, payments) if c == p.target))
+    proven, stopped = unreachable, False
+    assigned = {c.row: j for j, o in enumerate(outcomes) for c in o.result.checks}
+    if not unreachable:
+        by_row = {c.row: c for group in eligible for c in group}
+        order = sorted(by_row.values(), key=lambda c: (-c.amount, c.row))
+        rows_by_payment = [{c.row for c in group} for group in eligible]
+        items, kept = [], []
+        for c in order:
+            admitted = tuple(j for j in range(len(payments))
+                             if c.row in rows_by_payment[j] and c.amount <= ceilings[j])
+            if admitted:
+                items.append((c.amount, admitted))
+                kept.append(c)
+        seed = [assigned.get(c.row, -1) for c in kept]
+        best, status = _split_search(items, [p.target for p in payments], ceilings, seed, cancel, progress,
+                                     started + split_seconds)
+        assigned = {c.row: j for c, j in zip(kept, best) if j >= 0}
+        proven, stopped = status == "proven", status == "cancelled"
+    return _rebuild(checks, payments, outcomes, assigned, proven, stopped, date_field, started)
+
+
+def _rebuild(checks, payments, outcomes, assigned, proven, stopped, date_field, started):
+    """Resultados por pago a partir de la asignación fila -> pago. El tiempo del reparto va al primero."""
+    elapsed = time.monotonic() - started
+    rebuilt = []
+    for j, (payment, outcome) in enumerate(zip(payments, outcomes)):
+        mine = sorted((c for c in checks if assigned.get(c.row) == j), key=lambda c: c.row)
+        result = SearchResult(mine, payment.target, proven, outcome.result.elapsed + (elapsed if j == 0 else 0),
+                              "exact", not stopped, date_field)
+        rebuilt.append(PaymentOutcome(payment, result))
+    return rebuilt
 
 
 def customer_message(result: SearchResult) -> str:

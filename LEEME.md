@@ -41,10 +41,17 @@ mensajes. **Exportar CSV** guarda los pagos, la selección y los totales para ab
 **Varios pagos.** Se calculan en el orden de la lista. Un pago puede usar un
 e-cheque o varios, pero **un e-cheque elegido para un pago no se ofrece a los
 siguientes**. El cliente, las fechas y el criterio se aplican a cada pago sobre lo
-que quedó libre. El orden puede cambiar el resultado: el primer pago elige antes
-que los demás, y las búsquedas de cada pago siguen siendo las de siempre (no hay
-una optimización conjunta). Si detenés una búsqueda con varios pagos, los pagos
-que no llegaron a calcularse figuran como **Sin calcular** y no se puede registrar el lote.
+que quedó libre. En la **Progresiva** el orden importa: el primer pago elige antes
+que los demás. Con **Mejor suma posible** y varios pagos, el programa además
+**reparte los e-cheques entre todos los pagos**: busca el menor faltante total y, a
+igual faltante, que se completen exactamente más pagos (ningún pago supera su importe).
+Primero calcula un pago tras otro; si eso ya completa todos, o ya cubre lo máximo que
+cada pago lograría por separado, termina ahí. Si no, busca un reparto mejor durante
+hasta 10 segundos; si no llega a demostrar que es el mejor, lo informa («No se pudo
+demostrar que sea el mejor reparto») y lo marca así en el CSV. Con un solo pago, o con
+la Progresiva, no hay reparto. Si detenés una búsqueda con varios pagos, los pagos
+que no llegaron a calcularse figuran como **Sin calcular** y no se puede registrar el lote;
+si la detenés durante el reparto, se conserva el mejor reparto hallado y sí se puede registrar.
 
 **Registro.** Al presionar **Registrar pagos** (con confirmación), los e-cheques
 elegidos se guardan en `registro_echeques.json`, junto a `eCheck.exe`. El archivo

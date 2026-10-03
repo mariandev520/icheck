@@ -11,8 +11,9 @@ from datetime import date
 from pathlib import Path
 from tkinter import filedialog, font, messagebox, ttk
 
-from core import (DataError, Payment, batch_label, check_date, filter_checks, find_payments,
-                  list_sheets, money, parse_amount, parse_date, payments_message, read_excel)
+from core import (SPLIT_SECONDS, DataError, Payment, batch_label, check_date, filter_checks,
+                  find_payments, list_sheets, money, parse_amount, parse_date, payments_message,
+                  read_excel)
 from registro import Registry, default_path, format_timestamp
 
 
@@ -888,14 +889,20 @@ class Application:
             return ("La combinación más cercana sin pasarse",
                     "{} e-cheques seleccionados. La diferencia a completar por transferencia es {}.".format(
                         len(result.checks), money(result.transfer)))
-        if len(done) < len(outcomes) or not all(result.completed for result in done):
+        if len(done) < len(outcomes):
             return ("Búsqueda detenida · {} de {} pagos calculados".format(len(done), len(outcomes)),
                     "Los pagos sin calcular no tienen e-cheques asignados y no se pueden registrar. Volvé a buscar para completar el cálculo.")
+        if not all(result.completed for result in done):
+            return ("Búsqueda detenida · mejor reparto encontrado",
+                    "Ningún pago supera su importe, pero podría existir un reparto que complete más. Se puede registrar igual.")
         count = sum(len(result.checks) for result in done)
         transfer = sum(result.transfer for result in done)
         detail = "{} e-cheques distintos: ninguno se repite entre pagos. ".format(count)
         detail += ("Todos los pagos quedan cubiertos." if not transfer else
                    "Faltan {} por transferencia en total.".format(money(transfer)))
+        if transfer and all(result.strategy == "exact" for result in done):
+            detail += (" Es el mejor reparto posible entre los pagos." if all(result.optimal for result in done) else
+                       " No se pudo demostrar que sea el mejor reparto: se agotó el tiempo de búsqueda ({:g} s).".format(SPLIT_SECONDS))
         return "{} pagos calculados".format(len(outcomes)), detail
 
     def _found(self, outcomes):
@@ -1167,7 +1174,9 @@ class Application:
                 writer.writerow(["Archivo", safe(Path(self.path).name)])
                 writer.writerow(["Hoja", safe(self.imported.sheet)])
                 state = ("Búsqueda detenida; óptimo no confirmado" if not completed else
-                         "Selección progresiva" if done[0].strategy == "progressive" else "Óptimo confirmado")
+                         "Selección progresiva" if done[0].strategy == "progressive" else
+                         "Óptimo confirmado" if all(result.optimal for result in done) else
+                         "Reparto no demostrado como el mejor (tiempo agotado)")
                 writer.writerow(["Estado", state])
                 writer.writerow(["Registrado como utilizado", "Sí" if self.registered else "No"])
                 writer.writerow(["Fecha usada", date_field])

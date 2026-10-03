@@ -1,7 +1,9 @@
 import itertools
 import json
+import random
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import replace
 from datetime import date, datetime
@@ -10,6 +12,7 @@ from unittest.mock import patch
 
 from core import (DataError, Payment, PaymentOutcome, SearchResult, find_payments,
                   payments_message)
+from core import _split_search
 from registro import Registry, check_key, default_path
 from test_core import checks_for
 
@@ -231,6 +234,130 @@ class PaymentsTests(unittest.TestCase):
         self.assertEqual(Payment(1).label, "Todos los clientes")
         self.assertEqual(Payment(1, "0419", "Ana").label, "0419 · Ana")
         self.assertEqual(Payment(1, "0419").label, "0419")
+
+
+def sequential(checks, payments):
+    """Un pago tras otro, sin repartir: lo que se hacía antes del reparto conjunto."""
+    pool, outcomes = list(checks), []
+    for payment in payments:
+        outcome = find_payments(pool, [payment], progressive=False)[0]
+        outcomes.append(outcome)
+        taken = {c.row for c in outcome.result.checks}
+        pool = [c for c in pool if c.row not in taken]
+    return outcomes
+
+
+def score(outcomes):
+    """(total cubierto, pagos exactos): lo que el reparto maximiza, en ese orden."""
+    return (sum(o.result.total for o in outcomes), sum(o.result.transfer == 0 for o in outcomes))
+
+
+def best_possible(checks, payments):
+    """Búsqueda exhaustiva: todas las formas de asignar cada e-cheque a un pago o a ninguno."""
+    k, best = len(payments), (-1, -1)
+    for assign in itertools.product(range(k + 1), repeat=len(checks)):
+        sums = [0] * k
+        for check, a in zip(checks, assign):
+            if a < k:
+                if payments[a].client_id not in (None, check.client_id):
+                    break
+                sums[a] += check.amount
+        else:
+            if all(s <= p.target for s, p in zip(sums, payments)):
+                best = max(best, (sum(sums), sum(s == p.target for s, p in zip(sums, payments))))
+    return best
+
+
+class SplitTests(unittest.TestCase):
+    def assert_valid(self, outcomes, payments):
+        rows = [c.row for o in outcomes for c in o.result.checks]
+        self.assertEqual(len(rows), len(set(rows)))
+        for outcome, payment in zip(outcomes, payments):
+            self.assertLessEqual(outcome.result.total, payment.target)
+            self.assertTrue(all(payment.client_id in (None, c.client_id) for c in outcome.result.checks))
+
+    def test_splitting_completes_more_payments_than_one_after_another(self):
+        checks = checks_for([600, 900, 900, 200, 400])
+        payments = [Payment(1200), Payment(1100), Payment(1000)]
+        before, after = sequential(checks, payments), find_payments(checks, payments, progressive=False)
+        self.assertEqual(sum(o.result.transfer == 0 for o in before), 1)
+        self.assertEqual(sum(o.result.transfer == 0 for o in after), 2)
+        self.assertGreaterEqual(score(after), score(before))
+        self.assert_valid(after, payments)
+        self.assertTrue(all(o.result.optimal and o.result.completed for o in after))
+
+    def test_matches_the_exhaustive_optimum_on_random_cases(self):
+        rng = random.Random(41)
+        improved = 0
+        for case in range(120):
+            amounts = [rng.choice((100, 200, 300, 400, 500, 600, 700, 800, 900, rng.randrange(1, 90) * 10))
+                       for _ in range(rng.randrange(4, 8))]
+            checks = [replace(c, client_id=rng.choice("AAB")) for c in checks_for(amounts)]
+            payments = [Payment(rng.randrange(2, 16) * 100, rng.choice((None, None, "A", "B")))
+                        for _ in range(rng.choice((2, 3)))]
+            outcomes = find_payments(checks, payments, progressive=False)
+            with self.subTest(case=case, amounts=amounts, targets=[(p.target, p.client_id) for p in payments]):
+                self.assertEqual(score(outcomes), best_possible(checks, payments))
+                self.assertGreaterEqual(score(outcomes), score(sequential(checks, payments)))
+                self.assert_valid(outcomes, payments)
+                self.assertTrue(all(o.result.optimal and o.result.completed for o in outcomes))
+            improved += score(outcomes) > score(sequential(checks, payments))
+        self.assertGreater(improved, 0)
+
+    def test_nothing_to_split_when_every_payment_is_already_exact(self):
+        checks, payments = checks_for([500, 400, 300]), [Payment(500), Payment(400)]
+        with patch("core._split_search", side_effect=AssertionError("no debía repartir")):
+            outcomes = find_payments(checks, payments, progressive=False)
+        self.assertEqual([o.result.transfer for o in outcomes], [0, 0])
+        self.assertTrue(all(o.result.optimal for o in outcomes))
+
+    def test_progressive_mode_and_single_payment_never_split(self):
+        checks = checks_for([600, 900, 900, 200, 400])
+        with patch("core._split_search", side_effect=AssertionError("no debía repartir")):
+            find_payments(checks, [Payment(1200), Payment(1100), Payment(1000)], progressive=True)
+            find_payments(checks, [Payment(1150)], progressive=False)
+
+    def test_exhausted_time_is_reported_not_silent(self):
+        checks = checks_for([600, 900, 900, 200, 400])
+        payments = [Payment(1200), Payment(1100), Payment(1000)]
+        outcomes = find_payments(checks, payments, progressive=False, split_seconds=-1)
+        self.assert_valid(outcomes, payments)
+        self.assertTrue(all(o.result.completed and not o.result.optimal for o in outcomes))
+        self.assertGreaterEqual(score(outcomes), score(sequential(checks, payments)))
+
+    def test_search_status_is_translated_into_each_result(self):
+        checks = checks_for([600, 900, 900, 200, 400])
+        payments = [Payment(1200), Payment(1100), Payment(1000)]
+        for status, completed in (("timeout", True), ("cancelled", False), ("proven", True)):
+            with self.subTest(status=status), patch(
+                    "core._split_search", side_effect=lambda items, targets, ceilings, seed, *a, s=status: (list(seed), s)):
+                outcomes = find_payments(checks, payments, progressive=False)
+            self.assertTrue(all(o.result.completed == completed for o in outcomes))
+            self.assertTrue(all(o.result.optimal == (status == "proven") for o in outcomes))
+
+    def test_cancel_inside_the_search_keeps_a_valid_split(self):
+        rng = random.Random(5)
+        amounts = sorted((rng.randrange(1000, 9000) for _ in range(26)), reverse=True)
+        total = sum(amounts)
+        targets = [int(total * 0.6) + 1, int(total * 0.6) + 3]
+        items = [(a, (0, 1)) for a in amounts]
+        event = threading.Event()
+        event.set()
+        best, status = _split_search(items, targets, targets, [-1] * len(items), event, None, time.monotonic() + 60)
+        self.assertEqual(status, "cancelled")
+        for j, target in enumerate(targets):
+            self.assertLessEqual(sum(a for (a, _), who in zip(items, best) if who == j), target)
+
+    def test_progress_reports_the_remaining_total(self):
+        rng = random.Random(5)
+        amounts = sorted((rng.randrange(1000, 9000) for _ in range(26)), reverse=True)
+        total = sum(amounts)
+        targets = [int(total * 0.6) + 1, int(total * 0.6) + 3]
+        seen = []
+        with patch("core.time.monotonic", side_effect=itertools.count(0, 1)):
+            _split_search([(a, (0, 1)) for a in amounts], targets, targets, [-1] * len(amounts), None,
+                          seen.append, 10 ** 9)
+        self.assertTrue(seen and all(m.startswith("Repartiendo entre los pagos") for m in seen))
 
 
 if __name__ == "__main__":
