@@ -30,6 +30,10 @@ class AppCase(unittest.TestCase):
         self.root.withdraw()
         self.callback_errors = []
         self.root.report_callback_exception = lambda kind, error, trace: self.callback_errors.append(str(error))
+        for dialog in ("showwarning", "showerror", "showinfo", "askyesno"):
+            guard = patch("app.messagebox." + dialog, side_effect=AssertionError("diálogo inesperado: " + dialog))
+            guard.start()
+            self.addCleanup(guard.stop)
         self.app = Application(self.root, self.registry_path)
         self.checks = checks_for(list(self.amounts))
         self.app._loaded(("prueba.xlsx", ["Pagos"], ImportResult(self.checks, [], [], "Pagos")))
@@ -286,27 +290,33 @@ class MultiplePaymentsTests(AppCase):
         self.assertEqual([p.target for p in self.app.payments], [50000000, 40000000])
         self.assertEqual([c.amount for c in self.result(1).checks], [40000000])
 
-    def test_register_saves_json_and_excludes_those_checks_from_later_searches(self):
+    def test_saving_the_operation_writes_json_and_excludes_those_checks_from_later_searches(self):
         self.three_payments()
         self.assertEqual(str(self.app.register_button.cget("state")), "normal")
-        self.assertEqual(str(self.app.register_button.cget("text")), "Registrar pagos")
+        self.assertEqual(str(self.app.register_button.cget("text")), "Guardar operación")
         self.assertFalse(self.registry_path.exists())
-        self.register()
+        self.app.operation_name.set("  Cobro   de septiembre ")
+        with patch("app.messagebox.askyesno") as ask:
+            self.app.register()
+            ask.assert_not_called()  # guardar es un solo clic; se puede anular desde el registro
         data = json.loads(self.registry_path.read_text(encoding="utf-8"))
         self.assertEqual([p["id"] for p in data["pagos"]], [1, 2, 3])
+        self.assertEqual({(p["operacion"], p["nombre_operacion"]) for p in data["pagos"]},
+                         {(1, "Cobro de septiembre")})
         self.assertEqual([[c["importe"] for c in p["echeques"]] for p in data["pagos"]],
                          [["500000.00"], ["400000.00"], ["300000.00", "200000.00"]])
         self.assertEqual(data["pagos"][0]["archivo"], "prueba.xlsx")
         self.assertTrue(self.app.registered)
+        self.assertEqual(self.app.saved_operation, 1)
+        self.assertIn("«Cobro de septiembre» guardada", self.app.save_state.get())
         self.assertEqual(self.app.payments, [])
         self.assertEqual(self.app.available, [])
         self.assertEqual(str(self.app.register_button.cget("state")), "disabled")
+        self.assertEqual(str(self.app.saved_button.cget("state")), "normal")
         # Lo calculado sigue a la vista para copiar o exportar.
         self.assertEqual(str(self.app.copy_button.cget("state")), "normal")
         self.assertEqual(len(self.app.table.get_children()), 3)
-        with patch("app.messagebox.askyesno") as ask:
-            self.app.register()
-            ask.assert_not_called()
+        self.app.register()
         self.assertEqual(len(Registry.load(self.registry_path).payments), 3)
         self.add("100.000")
         with patch("app.messagebox.showwarning") as warning:
@@ -314,14 +324,37 @@ class MultiplePaymentsTests(AppCase):
             warning.assert_called_once()
             self.assertIn("ya figuran como utilizados", warning.call_args[0][1])
         self.assertIsNone(self.app.results)
+        self.assertIsNone(self.app.saved_info)
 
-    def test_declining_the_confirmation_registers_nothing(self):
+    def test_the_save_bar_is_always_visible_and_guides_each_step(self):
+        self.assertEqual(str(self.app.register_button.cget("state")), "disabled")
+        self.assertEqual(str(self.app.register_button.cget("text")), "Guardar operación")
+        self.assertTrue(self.app.register_button.winfo_manager())  # empaquetado: aparece en pantalla
+        self.assertIn("Calculá los pagos", self.app.save_state.get())
         self.three_payments()
-        with patch("app.messagebox.askyesno", return_value=False):
-            self.app.register()
+        self.assertIn("presioná «Guardar operación»", self.app.save_state.get())
+        self.assertEqual(str(self.app.operation_entry.cget("state")), "normal")
+        self.assertEqual(str(self.app.saved_button.cget("state")), "disabled")
+        self.add("100.000")  # cambiar los pagos invalida el cálculo: hay que volver a buscar
+        self.assertEqual(str(self.app.register_button.cget("state")), "disabled")
+        self.assertEqual(str(self.app.operation_entry.cget("state")), "disabled")
+        self.assertIn("Calculá los pagos", self.app.save_state.get())
         self.assertFalse(self.registry_path.exists())
-        self.assertFalse(self.app.registered)
-        self.assertEqual(len(self.app.available), 4)
+
+    def test_an_unnamed_operation_gets_a_numbered_name_and_each_save_is_a_new_operation(self):
+        self.add("500.000")
+        self.app.search()
+        self.wait_for_search()
+        self.app.register()
+        self.assertEqual(self.app.saved_info[0], "Operación 1")
+        self.add("400.000")
+        self.app.search()
+        self.wait_for_search()
+        self.app.operation_name.set("Segundo cobro")
+        self.app.register()
+        operations = Registry.load(self.registry_path).operations()
+        self.assertEqual([(o.id, o.label) for o in operations], [(1, "Operación 1"), (2, "Segundo cobro")])
+        self.assertIn("2 operaciones", self.app.registry_info.get())
 
     def test_a_search_alone_never_burns_checks(self):
         self.three_payments()
@@ -398,28 +431,87 @@ class MultiplePaymentsTests(AppCase):
                 rows = list(csv.reader(handle, delimiter=";"))
         self.assertIn(["2", "Todos los clientes", "400000,00", "sin calcular", ""], rows)
 
-    def test_registry_window_lists_payments_and_voiding_frees_the_checks(self):
-        self.three_payments()
-        self.register()
-        self.app.show_registry()
-        window = next(w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel))
-        trees = [w for w in descendants(window) if w.winfo_class() == "Treeview"]
-        payments_view, checks_view = trees
-        listed = [payments_view.item(i, "values") for i in payments_view.get_children()]
-        self.assertEqual([v[0] for v in listed], ["3", "2", "1"])
-        self.assertEqual(listed[0][6], "Registrado")
-        payments_view.selection_set("3")
+    def open_registry(self, **options):
+        self.app.show_registry(**options)
+        window = [w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel)][-1]
+        operations_view, checks_view = [w for w in descendants(window) if w.winfo_class() == "Treeview"]
+        void = next(w for w in descendants(window) if w.winfo_class() == "TButton" and "Anular" in str(w.cget("text")))
+        return window, operations_view, checks_view, void
+
+    def test_registry_window_identifies_each_operation_and_clicking_shows_its_checks(self):
+        self.add("500.000")
+        self.add("400.000")
+        self.app.search()
+        self.wait_for_search()
+        self.app.operation_name.set("Cobro A")
+        self.app.register()
+        self.add("200.000")
+        self.app.search()
+        self.wait_for_search()
+        self.app.register()
+        window, operations_view, checks_view, _ = self.open_registry()
+        self.assertEqual(operations_view.get_children(), ("op2", "op1"))  # la más reciente primero
+        first = operations_view.item("op1")
+        self.assertEqual(first["text"], "#1 · Cobro A")
+        self.assertEqual(first["values"][1], "2 pagos")
+        self.assertEqual(first["values"][5], "Registrada")
+        self.assertEqual(operations_view.item("op2")["text"], "#2 · Operación 2")
+        self.assertEqual(operations_view.get_children("op1"), ("pay1", "pay2"))
+        operations_view.selection_set("op1")
         self.root.update()
-        self.assertEqual([checks_view.item(i, "values")[5] for i in checks_view.get_children()],
-                         ["$ 300.000,00", "$ 200.000,00"])
-        button = next(w for w in descendants(window) if w.winfo_class() == "TButton" and "Anular" in str(w.cget("text")))
+        self.assertEqual(len(checks_view.get_children()), 2)  # todos los e-cheques de la operación
+        operations_view.selection_set("pay2")
+        self.root.update()
+        self.assertEqual([checks_view.item(i, "values")[5] for i in checks_view.get_children()], ["$ 400.000,00"])
+        window.destroy()
+
+    def test_saved_button_opens_the_registry_on_that_operation(self):
+        self.add("500.000")
+        self.app.search()
+        self.wait_for_search()
+        self.app.operation_name.set("Cobro A")
+        self.app.register()
+        self.add("400.000")
+        self.app.search()
+        self.wait_for_search()
+        self.app.register()
+        self.app.saved_operation = 1  # volver a la primera operación guardada
+        self.app.show_saved()
+        window = [w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel)][-1]
+        operations_view = next(w for w in descendants(window) if w.winfo_class() == "Treeview")
+        self.assertEqual(operations_view.selection(), ("op1",))
+        window.destroy()
+
+    def test_voiding_an_operation_frees_all_its_checks_and_keeps_the_history(self):
+        self.three_payments()
+        self.app.register()
+        window, operations_view, checks_view, void = self.open_registry()
+        operations_view.selection_set("op1")
+        self.root.update()
         with patch("app.messagebox.askyesno", return_value=True):
-            button.invoke()
-        self.assertEqual(sorted(c.amount for c in self.app.available), [20000000, 30000000])
+            void.invoke()
+        self.assertEqual(len(self.app.available), 4)
         voided = Registry.load(self.registry_path)
-        self.assertIsNotNone(voided.payments[2].voided)
+        self.assertTrue(all(p.voided for p in voided.payments))
         self.assertEqual(len(voided.payments), 3)
-        self.assertTrue(payments_view.item("3", "values")[6].startswith("Anulado"))
+        self.assertEqual(operations_view.item("op1")["values"][5], "Anulada")
+        window.destroy()
+        self.add("500.000")
+        self.app.search()
+        self.wait_for_search()
+        self.assertEqual([c.amount for c in self.result().checks], [50000000])
+
+    def test_voiding_one_payment_frees_only_its_checks(self):
+        self.three_payments()
+        self.app.register()
+        window, operations_view, checks_view, void = self.open_registry()
+        operations_view.selection_set("pay3")
+        self.root.update()
+        with patch("app.messagebox.askyesno", return_value=True):
+            void.invoke()
+        self.assertEqual(sorted(c.amount for c in self.app.available), [20000000, 30000000])
+        self.assertEqual(operations_view.item("op1")["values"][5], "Parcialmente anulada")
+        self.assertTrue(operations_view.item("pay3")["values"][5].startswith("Anulado"))
         window.destroy()
         self.add("500.000")
         self.app.search()

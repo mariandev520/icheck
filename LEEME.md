@@ -26,8 +26,10 @@ usarlos. Trabaja localmente, sin cuentas ni conexión.
    **Priorizar la tanda de una semana anterior**.
 9. Presioná **Buscar combinación**. Si dejaste un importe escrito sin agregar,
    se suma como último pago. Con un solo pago alcanza con escribir el importe y buscar.
-10. Revisá el resultado y presioná **Registrar pagos** para guardar esos e-cheques
-    como utilizados (ver más abajo). Buscar solo calcula: no registra nada.
+10. Revisá el resultado. Debajo de los totales está la barra **3. GUARDAR OPERACIÓN**
+    (siempre visible; se habilita al calcular). Escribí, si querés, un **nombre** para
+    identificarla y presioná **Guardar operación**: esos e-cheques quedan registrados como
+    utilizados (ver más abajo). Buscar solo calcula: no guarda nada.
 
 El resultado muestra, por cada pago, el importe solicitado, el total seleccionado,
 el faltante por transferencia y el detalle de cada e-cheque, en el orden de selección.
@@ -53,11 +55,12 @@ la Progresiva, no hay reparto. Si detenés una búsqueda con varios pagos, los p
 que no llegaron a calcularse figuran como **Sin calcular** y no se puede registrar el lote;
 si la detenés durante el reparto, se conserva el mejor reparto hallado y sí se puede registrar.
 
-**Registro.** Al presionar **Registrar pagos** (con confirmación), los e-cheques
-elegidos se guardan en `registro_echeques.json`, junto a `eCheck.exe`. El archivo
-se crea al registrar el primer pago y es un JSON legible: por cada pago guarda
-número, fecha y hora, archivo y hoja de origen, cliente (si filtraste), importe
-solicitado, total, faltante y los datos de cada e-cheque. Los importes figuran como
+**Registro.** Una **operación** es una búsqueda con todos sus pagos. Al presionar
+**Guardar operación** (un solo clic), los e-cheques elegidos se guardan en
+`registro_echeques.json`, junto a `eCheck.exe`, siempre en ese JSON local. El archivo
+se crea al guardar la primera operación y es legible: por cada pago guarda número de
+operación, el nombre que le pusiste (o «Operación N»), fecha y hora, archivo y hoja de
+origen, cliente (si filtraste), importe solicitado, total, faltante y los datos de cada e-cheque. Los importes figuran como
 texto con dos decimales (`"500000.00"`). Desde ese momento esos e-cheques **no se
 vuelven a ofrecer**, tampoco al cerrar el programa ni al cargar otro Excel.
 
@@ -65,17 +68,23 @@ vuelven a ofrecer**, tampoco al cerrar el programa ni al cargar otro Excel.
   no por el número de fila ni por el recibo. Por eso sigue bloqueado aunque el Excel
   nuevo traiga las filas en otro orden. Si hay varios registros idénticos en todo eso,
   se descuentan tantos como veces se usaron.
-- **Registro…** muestra los pagos registrados y sus e-cheques. **Anular pago
-  seleccionado** devuelve sus e-cheques a la lista de disponibles; el pago queda
-  en el historial marcado como anulado. Es la forma de corregir un registro equivocado.
-- Después de registrar, la lista de pagos se vacía (no se pueden recalcular por error),
-  pero el resultado sigue en pantalla para copiar el mensaje o exportar.
+- **Registro…** (o **Ver en el registro**, que abre la operación recién guardada)
+  lista las operaciones con su número, nombre, fecha, cantidad de pagos y e-cheques,
+  total y estado. Al hacer clic en una operación se ven todos sus e-cheques; se
+  despliega para ver sus pagos y al hacer clic en un pago, los suyos. **Anular selección**
+  devuelve a la lista de disponibles los e-cheques de la operación (o del pago) elegido;
+  queda en el historial marcada como anulada. Es la forma de corregir una operación guardada
+  por error: no hay confirmación al guardar porque siempre se puede anular.
+- Después de guardar, la lista de pagos se vacía (no se pueden recalcular por error),
+  pero el resultado sigue en pantalla para copiar el mensaje o exportar; el CSV indica
+  la operación guardada.
 - Si el archivo de registro está dañado o fue editado a mano con un formato inválido,
   el programa **no busca** y no lo sobrescribe: avisa cuál es el archivo para que lo
   corrijas o lo muevas. Así nunca se reutilizan e-cheques sin aviso.
 - **Al actualizar el programa** (extraer un ZIP nuevo en otra carpeta), copiá
   `registro_echeques.json` junto al nuevo `eCheck.exe`. Si la carpeta no lo tiene, el
-  programa muestra «Registro nuevo» y no tendrá en cuenta lo usado antes. Conviene
+  programa muestra «Registro nuevo» y no tendrá en cuenta lo usado antes. Los registros
+  creados con versiones anteriores se siguen leyendo. Conviene
   hacer copia del archivo de vez en cuando.
 - Cada instalación lleva su propio registro. Si varias personas comparten el archivo
   (por ejemplo desde una carpeta de red), que no registren al mismo tiempo. Al

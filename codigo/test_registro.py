@@ -146,6 +146,62 @@ class RegistryTests(unittest.TestCase):
         self.path.write_bytes(b"\xef\xbb\xbf" + self.path.read_bytes())
         self.assertEqual(len(Registry.load(self.path).payments), 1)
 
+    def test_payments_saved_together_are_one_named_operation(self):
+        records = checks_for([300, 200, 100])
+        registry = Registry(self.path)
+        first = registry.add([outcome(Payment(300), records[:1]), outcome(Payment(200), records[1:2])],
+                             "a.xlsx", "Pagos", datetime(2026, 10, 3, 9, 0, 0), name="  Cobro   de\toctubre ")
+        second = registry.add([outcome(Payment(100), records[2:])], "a.xlsx", "Pagos")
+        self.assertEqual({p.operation for p in first}, {1})
+        self.assertEqual({p.operation for p in second}, {2})
+        self.assertEqual([p.id for p in first + second], [1, 2, 3])
+        registry.save()
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual([(p["operacion"], p["nombre_operacion"]) for p in data["pagos"]],
+                         [(1, "Cobro de octubre"), (1, "Cobro de octubre"), (2, "")])
+        operations = Registry.load(self.path).operations()
+        self.assertEqual([(o.id, o.label, len(o.payments), o.status) for o in operations],
+                         [(1, "Cobro de octubre", 2, "Registrada"), (2, "Operación 2", 1, "Registrada")])
+        self.assertEqual((operations[0].target, operations[0].total, len(operations[0].checks)), (500, 500, 2))
+        self.assertEqual(operations[0].file, "a.xlsx")
+        self.assertEqual(len(registry.add([outcome(Payment(5), records[:1])], "a.xlsx", "Pagos", name="x" * 300)[0].name), 100)
+
+    def test_voiding_an_operation_voids_every_payment_and_only_that_operation(self):
+        records = checks_for([300, 200, 100])
+        registry = Registry(self.path)
+        registry.add([outcome(Payment(300), records[:1]), outcome(Payment(200), records[1:2])], "a.xlsx", "Pagos")
+        registry.add([outcome(Payment(100), records[2:])], "a.xlsx", "Pagos")
+        voided = registry.void_operation(1, datetime(2026, 10, 5, 8, 0, 0))
+        self.assertEqual([p.id for p in voided], [1, 2])
+        self.assertEqual([o.status for o in registry.operations()], ["Anulada", "Registrada"])
+        self.assertEqual([c.amount for c in registry.split(records)[0]], [300, 200])
+        registry.void(3)
+        self.assertEqual(registry.split(records)[0], records)
+        with self.assertRaises(DataError):
+            registry.void_operation(1)
+        with self.assertRaises(DataError):
+            registry.void_operation(9)
+        registry = Registry(self.path)
+        registry.add([outcome(Payment(300), records[:1]), outcome(Payment(200), records[1:2])], "a.xlsx", "Pagos")
+        registry.void(1)
+        self.assertEqual(registry.operations()[0].status, "Parcialmente anulada")
+        self.assertEqual([p.id for p in registry.void_operation(1)], [2])
+
+    def test_a_registry_from_before_operations_still_blocks_its_checks(self):
+        records = checks_for([300, 200])
+        registry = Registry(self.path)
+        registry.add([outcome(Payment(300), records[:1]), outcome(Payment(200), records[1:])], "a.xlsx", "Pagos")
+        registry.save()
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        for payment in data["pagos"]:
+            del payment["operacion"], payment["nombre_operacion"]
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+        legacy = Registry.load(self.path)
+        self.assertEqual(legacy.split(records)[0], [])
+        self.assertEqual([(o.id, o.label) for o in legacy.operations()], [(1, "Operación 1"), (2, "Operación 2")])
+        legacy.add([outcome(Payment(100), [replace(records[0], row=50, amount=100)])], "a.xlsx", "Pagos")
+        self.assertEqual(legacy.operations()[-1].id, 3)
+
     def test_default_path_is_next_to_the_program(self):
         self.assertEqual(default_path().name, "registro_echeques.json")
         self.assertEqual(default_path().parent, Path(__file__).resolve().parent)

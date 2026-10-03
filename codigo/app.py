@@ -45,6 +45,8 @@ class Application:
         self.payments = []
         self.results = None
         self.registered = False
+        self.saved_info = None       # (nombre, pagos, e-cheques) de la operación recién guardada
+        self.saved_operation = None
         self.available = []
         self.client_names = {}
         self.busy = False
@@ -65,6 +67,8 @@ class Application:
         self.notice = tk.StringVar(value="Las fechas e identificadores originales se conservan sin modificaciones.")
         self.registry_info = tk.StringVar()
         self.payments_title = tk.StringVar(value="Pagos cargados (0)")
+        self.operation_name = tk.StringVar()
+        self.save_state = tk.StringVar()
         self.status = tk.StringVar(value="Listo para iniciar. Seleccioná un archivo .xlsx.")
         self.result_title = tk.StringVar(value="Resultados de la búsqueda")
         self.result_detail = tk.StringVar(value="Primero el monto exacto; si no, el más cercano sin pasarse.")
@@ -409,6 +413,31 @@ class Application:
             self.kpi_labels.append((val_lbl, color))
             summary.columnconfigure(col_idx, weight=1, uniform="kpi")
 
+        # GUARDAR LA OPERACIÓN EN EL REGISTRO (siempre visible; se habilita al calcular)
+        save_bar = tk.Frame(main_container, bg=BG_PANEL, padx=18, pady=12, highlightthickness=1, highlightbackground=CYAN_DIM)
+        save_bar.pack(fill="x", pady=(0, 12))
+        save_left = tk.Frame(save_bar, bg=BG_PANEL)
+        save_left.pack(side="left", fill="x", expand=True)
+        tk.Label(save_left, text="3. GUARDAR OPERACIÓN", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, 8, "bold")).pack(anchor="w")
+        self.save_label = tk.Label(save_left, textvariable=self.save_state, bg=BG_PANEL, fg=TEXT_MID,
+                                   font=(FONT_FAMILY, 9), anchor="w", justify="left", wraplength=600)
+        self.save_label.pack(anchor="w", pady=(2, 6))
+        name_row = tk.Frame(save_left, bg=BG_PANEL)
+        name_row.pack(fill="x")
+        tk.Label(name_row, text="Nombre de la operación (opcional):", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=(FONT_FAMILY, 8)).pack(side="left")
+        self.operation_entry = ttk.Entry(name_row, textvariable=self.operation_name, width=32, state="disabled")
+        self.operation_entry.pack(side="left", padx=(8, 0))
+        self.operation_entry.bind("<Return>", lambda event: self.register())
+        save_right = tk.Frame(save_bar, bg=BG_PANEL)
+        save_right.pack(side="right", padx=(12, 0))
+        self.register_button = ttk.Button(save_right, text="Guardar operación", command=self.register,
+                                          state="disabled", style="Primary.TButton")
+        self.register_button.pack(anchor="e")
+        self.saved_button = ttk.Button(save_right, text="Ver en el registro", command=self.show_saved, state="disabled")
+        self.saved_button.pack(anchor="e", pady=(6, 0))
+
         # TABLA DE CHEQUES
         table_card = tk.Frame(main_container, bg=BG_PANEL, padx=18, pady=14, highlightthickness=1, highlightbackground=BORDER)
         table_card.pack(fill="both", expand=True, pady=(0, 12))
@@ -429,10 +458,7 @@ class Application:
         self.copy_button = ttk.Button(tc_actions, text="Copiar mensaje", command=self.copy_message, state="disabled")
         self.copy_button.pack(side="left", padx=(0, 8))
         self.export_button = ttk.Button(tc_actions, text="Exportar CSV…", command=self.export, state="disabled")
-        self.export_button.pack(side="left", padx=(0, 8))
-        self.register_button = ttk.Button(tc_actions, text="Registrar pagos", command=self.register,
-                                          state="disabled", style="Primary.TButton")
-        self.register_button.pack(side="left")
+        self.export_button.pack(side="left")
 
         table_frame = tk.Frame(table_card, bg=BG_PANEL)
         table_frame.pack(fill="both", expand=True)
@@ -583,13 +609,16 @@ class Application:
     def _on_window_resize(self, event):
         if event.widget == self.root:
             self.message_label.configure(wraplength=max(400, self.root.winfo_width() - 80))
-            self.result_detail_label.configure(wraplength=max(300, self.root.winfo_width() - 560))
+            self.result_detail_label.configure(wraplength=max(300, self.root.winfo_width() - 440))
+            self.save_label.configure(wraplength=max(360, self.root.winfo_width() - 330))
 
     def _invalidate(self, *args):
         if self.busy:
             return
         self.results = None
         self.registered = False
+        self.saved_info = self.saved_operation = None
+        self.operation_name.set("")
         self._stop_result_animations()
         self.search_context = {}
         self.table.delete(*self.table.get_children())
@@ -761,10 +790,12 @@ class Application:
         self.available, used = registry.split(checks)
         active = [payment for payment in registry.payments if not payment.voided]
         if not self.registry_path.exists():
-            self.registry_info.set("Registro nuevo: se crea al registrar el primer pago ({}).".format(self.registry_path))
+            self.registry_info.set("Registro nuevo: se crea al guardar la primera operación ({}).".format(self.registry_path))
         else:
-            self.registry_info.set("Registro: {} pagos · {} e-cheques utilizados · {}".format(
-                len(active), sum(len(payment.checks) for payment in active), self.registry_path))
+            operations = len({payment.operation for payment in active})
+            self.registry_info.set("Registro: {} operaci{} · {} e-cheques utilizados · {}".format(
+                operations, "ón" if operations == 1 else "ones", sum(len(payment.checks) for payment in active),
+                self.registry_path))
         if self.imported:
             clients = len({check.client_id for check in checks})
             total = money(sum(check.amount for check in self.available))
@@ -969,41 +1000,62 @@ class Application:
         self.copy_button.configure(state="normal" if shown else "disabled")
         self.export_button.configure(state="normal" if shown else "disabled")
         chosen = self._registrable()
-        self.register_button.configure(state="normal" if chosen and not self.busy else "disabled",
-                                       text="Registrar pago" if len(chosen) == 1 else "Registrar pagos")
+        can_save = bool(chosen) and not self.busy
+        self.register_button.configure(state="normal" if can_save else "disabled")
+        self.operation_entry.configure(state="normal" if can_save else "disabled")
+        self.saved_button.configure(state="normal" if self.registered and not self.busy else "disabled")
+        if self.registered and self.saved_info:
+            label, payments, checks = self.saved_info
+            self.save_state.set("✔ «{}» guardada: {} pago{} y {} e-cheque{} registrados en {}. Ya no se ofrecen "
+                                "en nuevas búsquedas.".format(label, payments, "" if payments == 1 else "s",
+                                                              checks, "" if checks == 1 else "s", self.registry_path.name))
+        elif chosen:
+            count = sum(len(outcome.result.checks) for outcome in chosen)
+            self.save_state.set("Revisá el resultado y presioná «Guardar operación»: se registran estos {} e-cheque{} "
+                                "({} pago{}) y no se vuelven a ofrecer en otras búsquedas.".format(
+                                    count, "" if count == 1 else "s", len(chosen), "" if len(chosen) == 1 else "s"))
+        elif self.results and any(outcome.result is None for outcome in self.results):
+            self.save_state.set("Hay pagos sin calcular. Volvé a buscar para poder guardar la operación.")
+        elif self.results:
+            self.save_state.set("No hay e-cheques seleccionados para guardar en esta operación.")
+        else:
+            self.save_state.set("Calculá los pagos para poder guardar la operación en el registro.")
 
     def register(self):
+        """Guarda la búsqueda como una operación: sus e-cheques dejan de ofrecerse."""
         chosen = self._registrable()
         if self.busy or not chosen:
             return
         count = sum(len(outcome.result.checks) for outcome in chosen)
-        if not messagebox.askyesno(
-                "Registrar como utilizados",
-                "Se registrarán {} pago{} con {} e-cheque{}.\n\nNo volverán a ofrecerse en nuevas búsquedas "
-                "(podés anular el pago desde Registro…).".format(
-                    len(chosen), "" if len(chosen) == 1 else "s", count, "" if count == 1 else "s")):
-            return
         try:
             registry = Registry.load(self.registry_path)
             selected = [check for outcome in chosen for check in outcome.result.checks]
             if registry.conflicts(self.imported.checks, selected):
                 raise DataError("Alguno de estos e-cheques ya figura como utilizado en el registro (¿otra ventana o "
-                                "PC?). No se registró nada: volvé a buscar para obtener una selección actualizada.")
-            registry.add(chosen, Path(self.path).name, self.imported.sheet)
+                                "PC?). No se guardó nada: volvé a buscar para obtener una selección actualizada.")
+            added = registry.add(chosen, Path(self.path).name, self.imported.sheet, name=self.operation_name.get())
             registry.save()
         except (DataError, OSError) as exc:
-            messagebox.showerror("No se pudo registrar", str(exc))
+            messagebox.showerror("No se pudo guardar la operación", str(exc))
             return
+        operation = registry.operations()[-1]
         self.registered = True
-        self.payments = []  # lo registrado ya no es una lista pendiente: no puede recalcularse por error
+        self.saved_operation = operation.id
+        self.saved_info = (operation.label, len(added), count)
+        self.payments = []  # lo guardado ya no es una lista pendiente: no puede recalcularse por error
         self._refresh_payments()
         self._refresh_availability()
         self._update_actions()
-        self.result_detail.set("Registrado: {} pago{} y {} e-cheque{}. Ya no se ofrecen en nuevas búsquedas.".format(
-            len(chosen), "" if len(chosen) == 1 else "s", count, "" if count == 1 else "s"))
-        self.status.set("Pagos registrados. Podés copiar el mensaje o exportar antes de cargar nuevos pagos.")
+        self.result_detail.set("Guardada como «{}». Sus e-cheques ya no se ofrecen en nuevas búsquedas.".format(operation.label))
+        self.status.set("Operación guardada en {}. Podés copiar el mensaje o exportar antes de cargar nuevos pagos.".format(
+            self.registry_path))
 
-    def show_registry(self):
+    def show_saved(self):
+        if self.saved_operation is not None:
+            self.show_registry(select=self.saved_operation)
+
+    def show_registry(self, select=None):
+        """Operaciones guardadas: se hace clic en una para ver sus pagos y e-cheques."""
         if self.busy:
             return
         try:
@@ -1012,8 +1064,8 @@ class Application:
             messagebox.showerror("No se pudo leer el registro", str(exc))
             return
         window = tk.Toplevel(self.root)
-        window.title("Registro de e-cheques utilizados")
-        window.geometry("920x600")
+        window.title("Registro de operaciones")
+        window.geometry("1000x680")
         window.configure(bg=BG_PANEL, padx=14, pady=12)
         window.transient(self.root)
         tk.Label(window, text="Archivo: {}".format(self.registry_path), bg=BG_PANEL, fg=TEXT_MUTED,
@@ -1022,75 +1074,119 @@ class Application:
         buttons = tk.Frame(window, bg=BG_PANEL)
         buttons.pack(side="bottom", fill="x", pady=(10, 0))
         ttk.Button(buttons, text="Cerrar", command=window.destroy).pack(side="right")
-        ttk.Button(buttons, text="Anular pago seleccionado", command=lambda: void(),
+        ttk.Button(buttons, text="Anular selección", command=lambda: void(),
                    style="Danger.TButton").pack(side="right", padx=(0, 8))
+        tk.Label(buttons, text="Seleccioná una operación (o uno de sus pagos) para ver sus e-cheques o anularla.",
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=(self.FONT_FAMILY, 8)).pack(side="left")
 
-        def tree(columns, headings, widths, height):
+        def tree(columns, headings, widths, height, tree_title=None):
             frame = tk.Frame(window, bg=BG_PANEL)
             frame.pack(fill="both", expand=True, pady=(6, 0))
-            view = ttk.Treeview(frame, columns=columns, show="headings", height=height, style="Payments.Treeview")
+            view = ttk.Treeview(frame, columns=columns, show="tree headings" if tree_title else "headings",
+                                height=height, style="Payments.Treeview")
+            if tree_title:
+                view.heading("#0", text=tree_title)
+                view.column("#0", width=360, minwidth=160, anchor="w")
             for col, title, width in zip(columns, headings, widths):
                 view.heading(col, text=title)
-                view.column(col, width=width, minwidth=40, anchor="e" if "Importe" in title or title in ("Total", "Solicitado") else "w")
+                view.column(col, width=width, minwidth=40, anchor="e" if title in ("Importe", "Total", "Solicitado") else "w")
             scroll = ttk.Scrollbar(frame, orient="vertical", command=view.yview)
             view.configure(yscrollcommand=scroll.set)
             view.pack(side="left", fill="both", expand=True)
             scroll.pack(side="left", fill="y")
             return view
 
-        payments_view = tree(("id", "date", "client", "target", "count", "total", "state"),
-                             ("Pago", "Registrado", "Cliente", "Solicitado", "E-cheques", "Total", "Estado"),
-                             (60, 130, 200, 110, 90, 110, 180), 5)
-        tk.Label(window, text="E-cheques del pago seleccionado", bg=BG_PANEL, fg=TEXT_MUTED,
-                 font=(self.FONT_FAMILY, 8, "bold"), anchor="w").pack(fill="x", pady=(10, 0))
+        operations_view = tree(("date", "client", "target", "count", "total", "state"),
+                               ("Registrada", "Cliente", "Solicitado", "E-cheques", "Total", "Estado"),
+                               (125, 110, 110, 95, 110, 150), 7, "Operación / pago")
+        detail = tk.StringVar(value="Sin selección.")
+        tk.Label(window, textvariable=detail, bg=BG_PANEL, fg=TEXT_MID, font=(self.FONT_FAMILY, 9), anchor="w",
+                 justify="left", wraplength=940).pack(fill="x", pady=(10, 0))
         checks_view = tree(("reference", "date_f", "date_g", "id", "name", "amount", "receipt"),
                            ("Referencia", "Fecha F", "Fecha G", "ID Cliente", "Cliente", "Importe", "Recibo"),
-                           (110, 90, 90, 80, 200, 120, 110), 5)
+                           (110, 90, 90, 80, 200, 120, 110), 6)
         state = {"registry": registry}
 
-        def fill():
-            payments_view.delete(*payments_view.get_children())
+        def fill(keep=None):
+            operations_view.delete(*operations_view.get_children())
             checks_view.delete(*checks_view.get_children())
-            for payment in reversed(state["registry"].payments):
-                payments_view.insert("", "end", iid=str(payment.id), values=(
-                    payment.id, format_timestamp(payment.registered),
-                    "Todos los clientes" if payment.client_id is None else payment.client_id,
-                    money(payment.target), len(payment.checks), money(payment.total),
-                    "Anulado " + format_timestamp(payment.voided) if payment.voided else "Registrado"))
+            operations = list(reversed(state["registry"].operations()))
+            for position, operation in enumerate(operations):
+                parent = operations_view.insert(
+                    "", "end", iid="op{}".format(operation.id), open=position == 0 or operation.id == select,
+                    text="#{} · {}".format(operation.id, operation.label),
+                    values=(format_timestamp(operation.registered), "{} pago{}".format(
+                        len(operation.payments), "" if len(operation.payments) == 1 else "s"),
+                        money(operation.target), len(operation.checks), money(operation.total), operation.status))
+                for payment in operation.payments:
+                    operations_view.insert(
+                        parent, "end", iid="pay{}".format(payment.id), text="Pago {}".format(payment.id),
+                        values=("", "Todos los clientes" if payment.client_id is None else payment.client_id,
+                                money(payment.target), len(payment.checks), money(payment.total),
+                                "Anulado " + format_timestamp(payment.voided) if payment.voided else "Registrado"))
+            wanted = keep or ("op{}".format(select) if select is not None else None)
+            if wanted and operations_view.exists(wanted):
+                operations_view.selection_set(wanted)
+                operations_view.see(wanted)
+
+        def selected():
+            """('op'|'pay', número, pagos de la selección) o None."""
+            chosen = operations_view.selection()
+            if not chosen:
+                return None
+            kind, number = ("op", int(chosen[0][2:])) if chosen[0].startswith("op") else ("pay", int(chosen[0][3:]))
+            members = [payment for payment in state["registry"].payments
+                       if (payment.operation if kind == "op" else payment.id) == number]
+            return (kind, number, members) if members else None
 
         def show_checks(event=None):
             checks_view.delete(*checks_view.get_children())
-            selection = payments_view.selection()
-            payment = next((item for item in state["registry"].payments if selection and str(item.id) == selection[0]), None)
-            for check in payment.checks if payment else []:
-                checks_view.insert("", "end", values=(check.reference, check.date_f, check.date_g, check.client_id,
-                                                      check.client_name, money(check.amount), check.receipt))
+            current = selected()
+            if current is None:
+                detail.set("Sin selección.")
+                return
+            kind, number, members = current
+            first = members[0]
+            if kind == "op":
+                operation = next(op for op in state["registry"].operations() if op.id == number)
+                detail.set("Operación {} · «{}» · registrada el {} · archivo {} (hoja {}) · {} pago{} · {}".format(
+                    number, operation.label, format_timestamp(first.registered), first.file, first.sheet,
+                    len(members), "" if len(members) == 1 else "s", operation.status))
+            else:
+                detail.set("Pago {} de la operación {} · solicitado {} · e-cheques {} · a completar por transferencia {}".format(
+                    number, first.operation, money(first.target), money(first.total), money(first.transfer)))
+            for payment in members:
+                for check in payment.checks:
+                    checks_view.insert("", "end", values=(check.reference, check.date_f, check.date_g, check.client_id,
+                                                          check.client_name, money(check.amount), check.receipt))
 
         def void():
-            selection = payments_view.selection()
-            if not selection:
-                messagebox.showinfo("Anular pago", "Seleccioná primero el pago que querés anular.", parent=window)
+            current = selected()
+            if current is None:
+                messagebox.showinfo("Anular", "Seleccioná primero la operación o el pago que querés anular.", parent=window)
                 return
-            number = int(selection[0])
-            if not messagebox.askyesno("Anular pago {}".format(number),
-                                       "Los e-cheques del pago {} volverán a estar disponibles. "
-                                       "El pago queda en el historial como anulado.".format(number), parent=window):
+            kind, number, members = current
+            what = "la operación {}".format(number) if kind == "op" else "el pago {}".format(number)
+            if not messagebox.askyesno("Anular", "Los e-cheques de {} volverán a estar disponibles. "
+                                       "Queda en el historial como anulada.".format(what), parent=window):
                 return
             try:
                 fresh = Registry.load(self.registry_path)
-                fresh.void(number)
+                fresh.void_operation(number) if kind == "op" else fresh.void(number)
                 fresh.save()
             except (DataError, OSError) as exc:
                 messagebox.showerror("No se pudo anular", str(exc), parent=window)
                 return
             state["registry"] = fresh
             self._refresh_availability()
-            fill()
-            self.status.set("Pago {} anulado: sus e-cheques están disponibles otra vez.".format(number))
+            fill(keep=operations_view.selection()[0] if operations_view.selection() else None)
+            show_checks()
+            self.status.set("Se anuló {}: sus e-cheques están disponibles otra vez.".format(what))
 
-        payments_view.bind("<<TreeviewSelect>>", show_checks)
+        operations_view.bind("<<TreeviewSelect>>", show_checks)
         window.bind("<Escape>", lambda event: window.destroy())
         fill()
+        show_checks()
 
     def _poll(self):
         self.root.after_cancel(self.poll_timer)
@@ -1179,6 +1275,8 @@ class Application:
                          "Reparto no demostrado como el mejor (tiempo agotado)")
                 writer.writerow(["Estado", state])
                 writer.writerow(["Registrado como utilizado", "Sí" if self.registered else "No"])
+                if self.registered and self.saved_info:
+                    writer.writerow(["Operación guardada", safe("#{} · {}".format(self.saved_operation, self.saved_info[0]))])
                 writer.writerow(["Fecha usada", date_field])
                 writer.writerow(["Desde", safe(self.search_context.get("from", ""))])
                 writer.writerow(["Hasta", safe(self.search_context.get("to", ""))])

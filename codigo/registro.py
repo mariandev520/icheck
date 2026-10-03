@@ -55,6 +55,8 @@ class RegisteredPayment:
     sheet: str
     checks: List[Check]
     voided: Optional[str] = None
+    operation: int = 0
+    name: str = ""
 
     @property
     def total(self) -> int:
@@ -63,6 +65,49 @@ class RegisteredPayment:
     @property
     def transfer(self) -> int:
         return self.target - self.total
+
+
+@dataclass
+class Operation:
+    """Una búsqueda guardada: los pagos registrados juntos."""
+    id: int
+    name: str
+    payments: List[RegisteredPayment]
+
+    @property
+    def label(self) -> str:
+        return self.name or "Operación {}".format(self.id)
+
+    @property
+    def registered(self) -> str:
+        return self.payments[0].registered
+
+    @property
+    def file(self) -> str:
+        return self.payments[0].file
+
+    @property
+    def sheet(self) -> str:
+        return self.payments[0].sheet
+
+    @property
+    def checks(self) -> List[Check]:
+        return [check for payment in self.payments for check in payment.checks]
+
+    @property
+    def target(self) -> int:
+        return sum(payment.target for payment in self.payments)
+
+    @property
+    def total(self) -> int:
+        return sum(payment.total for payment in self.payments)
+
+    @property
+    def status(self) -> str:
+        voided = sum(1 for payment in self.payments if payment.voided)
+        if not voided:
+            return "Registrada"
+        return "Anulada" if voided == len(self.payments) else "Parcialmente anulada"
 
 
 def _check_to_json(check: Check) -> dict:
@@ -80,7 +125,8 @@ def _check_from_json(item: dict) -> Check:
 
 
 def _payment_to_json(payment: RegisteredPayment) -> dict:
-    data = {"id": payment.id, "registrado": payment.registered, "cliente_filtro": payment.client_id,
+    data = {"id": payment.id, "operacion": payment.operation, "nombre_operacion": payment.name,
+            "registrado": payment.registered, "cliente_filtro": payment.client_id,
             "archivo": payment.file, "hoja": payment.sheet,
             "importe_solicitado": _text(payment.target), "total_echeques": _text(payment.total),
             "transferencia": _text(payment.transfer)}
@@ -95,7 +141,8 @@ def _payment_from_json(item: dict) -> RegisteredPayment:
     return RegisteredPayment(int(item["id"]), str(item["registrado"]), _cents(item["importe_solicitado"]),
                              None if client is None else str(client), str(item["archivo"]), str(item["hoja"]),
                              [_check_from_json(check) for check in item["echeques"]],
-                             item.get("anulado") or None)
+                             item.get("anulado") or None,
+                             int(item.get("operacion", item["id"])), str(item.get("nombre_operacion", "")))
 
 
 def format_timestamp(value: str) -> str:
@@ -184,10 +231,19 @@ class Registry:
                 missing.append(check)
         return missing
 
-    def add(self, outcomes, file: str, sheet: str, when: Optional[datetime] = None) -> List[RegisteredPayment]:
-        """Agrega los pagos con e-cheques; los demás no tienen nada que registrar."""
+    def operations(self) -> List[Operation]:
+        groups = {}
+        for payment in self.payments:
+            groups.setdefault(payment.operation, []).append(payment)
+        return [Operation(number, payments[0].name, payments) for number, payments in groups.items()]
+
+    def add(self, outcomes, file: str, sheet: str, when: Optional[datetime] = None,
+            name: str = "") -> List[RegisteredPayment]:
+        """Agrega, como una operación, los pagos con e-cheques; los demás no tienen nada que registrar."""
         stamp = (when or datetime.now()).isoformat(timespec="seconds")
         number = max((payment.id for payment in self.payments), default=0)
+        operation = max((payment.operation for payment in self.payments), default=0) + 1
+        name = " ".join(str(name).split())[:100]
         added = []
         for outcome in outcomes:
             result = outcome.result
@@ -195,12 +251,25 @@ class Registry:
                 continue
             number += 1
             added.append(RegisteredPayment(number, stamp, result.target, outcome.payment.client_id,
-                                           file, sheet, list(result.checks)))
+                                           file, sheet, list(result.checks), None, operation, name))
         rows = [check.row for payment in added for check in payment.checks]
         if len(set(rows)) != len(rows):
             raise RuntimeError("Un e-cheque quedó asignado a más de un pago.")
         self.payments.extend(added)
         return added
+
+    def void_operation(self, operation_id: int, when: Optional[datetime] = None) -> List[RegisteredPayment]:
+        """Anula todos los pagos activos de una operación."""
+        members = [payment for payment in self.payments if payment.operation == operation_id]
+        if not members:
+            raise DataError("No existe la operación {} en el registro.".format(operation_id))
+        active = [payment for payment in members if not payment.voided]
+        if not active:
+            raise DataError("La operación {} ya estaba anulada.".format(operation_id))
+        stamp = (when or datetime.now()).isoformat(timespec="seconds")
+        for payment in active:
+            payment.voided = stamp
+        return active
 
     def void(self, payment_id: int, when: Optional[datetime] = None) -> RegisteredPayment:
         """Anula un pago: sus e-cheques vuelven a estar disponibles. El historial se conserva."""
