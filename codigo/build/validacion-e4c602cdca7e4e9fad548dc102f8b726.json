@@ -1,0 +1,10 @@
+{
+  "ok": true,
+  "total_cents": 45000000,
+  "transfer_cents": 5000000,
+  "tk": "8.6.15",
+  "frozen": true,
+  "callback_errors": [],
+  "weekly_selection": true,
+  "date_filter": true
+}

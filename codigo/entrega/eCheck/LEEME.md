@@ -103,22 +103,8 @@ importe, cliente, fechas o criterio invalida el resultado anterior para evitar
 copiar o exportar una selección desactualizada. Al cargar otro archivo u hoja
 se limpian los límites de fecha.
 
-## Registro de selecciones guardadas
-
-Con una combinación encontrada, **Guardar selección** la anota en un registro
-local (`registro.json`, en `%APPDATA%\eCheck`; se puede cambiar con la variable
-`ECHECK_REGISTRO`). Pide una nota opcional y avisa si algún e-cheque ya figura
-en otra selección guardada del mismo archivo y hoja.
-**Registro…** lista lo guardado: **Cargar selección** (o doble clic) vuelve a
-mostrarla para copiar el mensaje o exportar el CSV, sin necesidad de abrir el
-Excel; **Eliminar** la quita y devuelve esos e-cheques a las búsquedas. Para
-copiarlo a otra PC, llevá ese archivo JSON.
-
-Mientras esté activada **Excluir e-cheques ya guardados en el registro**
-(por defecto), cada búsqueda descarta los e-cheques guardados antes del mismo
-archivo y hoja (se identifican por fila, referencia e importe), y el estado
-informa cuántos se omitieron. Desactivala para ignorar el registro.
-
+Esta primera versión no lleva un historial de cheques utilizados: las búsquedas
+son independientes. Cargá un listado de cheques disponibles para cada operación.
 El Excel original no se modifica y los datos no se envían a servicios externos.
 
 ## Ejecutar desde el código fuente
