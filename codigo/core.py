@@ -95,6 +95,7 @@ class SearchResult:
     strategy: str = "exact"
     completed: bool = True
     date_field: str = "G"
+    count_minimal: bool = True
 
     @property
     def total(self) -> int:
@@ -507,6 +508,74 @@ def find_combination(checks: List[Check], target: int, cancel=None,
             report("Buscando… mejor total hasta ahora: {}. Nunca supera lo solicitado.".format(money(best * divisor)))
             last_report = time.monotonic()
     return from_mask(best_mask, True)
+
+
+def find_fewest(checks: List[Check], target: int, cancel=None,
+                progress: Optional[Callable[[str], None]] = None,
+                node_limit: int = 3_000_000) -> SearchResult:
+    """Mejor suma <= objetivo usando la menor cantidad de e-cheques, con los más altos.
+
+    1) find_combination fija la mejor suma posible y una selección válida inicial.
+    2) Ramificación y acotación de mayor a menor: cada hallazgo con la misma suma y
+       menos e-cheques reemplaza al anterior; se poda toda rama que no pueda mejorarlo
+       (cota: cuántos de los más altos restantes harían falta). Sin tope de cantidad.
+    Si se agota el presupuesto de nodos o se cancela, devuelve lo mejor hallado con
+    count_minimal=False.
+    """
+    started = time.monotonic()
+    base = find_combination(checks, target, cancel, progress)
+
+    def done(selected, minimal):
+        ordered = sorted(selected, key=lambda c: (-c.amount, c.row))
+        return SearchResult(ordered, target, base.optimal, time.monotonic() - started,
+                            "fewest", base.completed, base.date_field, minimal and base.completed)
+
+    if not base.completed or len(base.checks) <= 1:
+        return done(base.checks, len(base.checks) <= 1)
+    goal = base.total
+    pool = sorted((c for c in checks if c.amount <= goal), key=lambda c: (-c.amount, c.row))
+    values = [c.amount for c in pool]
+    n = len(values)
+    neg = [-v for v in values]
+    prefix = [0]
+    for v in values:
+        prefix.append(prefix[-1] + v)
+    best, best_n = None, len(base.checks)
+    path, nodes, exhausted = [], 0, True
+    last_report = time.monotonic()
+    # Entrada: (próximo índice, saldo, largo de path previo, índice a agregar o -1)
+    stack = [(0, goal, 0, -1)]
+    while stack:
+        j, rest, depth, add = stack.pop()
+        del path[depth:]
+        if add >= 0:
+            path.append(add)
+        count = len(path)
+        if rest == 0:
+            if count < best_n:
+                best, best_n = list(path), count
+            continue
+        nodes += 1
+        if nodes > node_limit or (nodes % 4096 == 0 and cancel is not None and cancel.is_set()):
+            exhausted = False
+            break
+        if count + 1 >= best_n:
+            continue
+        j = bisect_left(neg, -rest, j, n)  # primer valor <= saldo
+        if j >= n:
+            continue
+        need = bisect_left(prefix, rest + prefix[j], j + 1) - j  # mínimo de e-cheques restantes
+        if j + need > n or count + need >= best_n:
+            continue
+        if progress and time.monotonic() - last_report >= 0.2:
+            progress("Reduciendo cantidad de e-cheques… mejor hasta ahora: {}.".format(best_n))
+            last_report = time.monotonic()
+        # Omitir = no tomar más de este grupo de montos iguales; tomar = usar el índice j.
+        stack.append((bisect_left(neg, neg[j] + 1, j, n), rest, count, -1))
+        stack.append((j + 1, rest - values[j], count, j))
+    if best is None:
+        return done(base.checks, exhausted)
+    return done([pool[i] for i in best], exhausted)
 
 
 def customer_message(result: SearchResult) -> str:

@@ -9,7 +9,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from core import (Check, DataError, batch_label, check_date, customer_message, filter_checks,
-                  find_combination, find_progressive, list_sheets, money, numeric_cents,
+                  find_combination, find_fewest, find_progressive, list_sheets, money, numeric_cents,
                   parse_amount, parse_date, read_excel, week_start)
 import core
 
@@ -238,6 +238,41 @@ class ProgressiveTests(unittest.TestCase):
         self.assertEqual(len(result.checks),20000)
         self.assertEqual(result.transfer,1)
         self.assertTrue(result.optimal)
+
+
+class FewestTests(unittest.TestCase):
+    def test_four_big_checks_instead_of_long_list(self):
+        values = [50000000] * 4 + [100000] * 300 + [7000000, 3000000]
+        result = find_fewest(checks_for(values), 200000000)
+        self.assertEqual(result.total, 200000000)
+        self.assertEqual([c.amount for c in result.checks], [50000000] * 4)
+        self.assertTrue(result.count_minimal)
+
+    def test_prefers_highest_among_same_count(self):
+        result = find_fewest(checks_for([600, 500, 400, 300, 200, 100]), 1000)
+        self.assertEqual([c.amount for c in result.checks], [600, 400])
+
+    def test_best_sum_then_fewest_never_exceeds(self):
+        result = find_fewest(checks_for([800, 700, 600, 500]), 1100)
+        self.assertEqual(result.total, 1100)
+        self.assertEqual(len(result.checks), 2)
+        result = find_fewest(checks_for([1000, 2000]), 500)
+        self.assertEqual(result.checks, [])
+
+    def test_random_matches_find_combination_total_and_minimal_count(self):
+        rng = random.Random(55)
+        for _ in range(80):
+            values = [rng.randrange(1, 60) for _ in range(rng.randrange(1, 11))]
+            target = rng.randrange(1, sum(values) + 20)
+            best = find_combination(checks_for(values), target)
+            result = find_fewest(checks_for(values), target)
+            self.assertEqual(result.total, best.total)
+            self.assertLessEqual(len(result.checks), len(best.checks))
+            self.assertEqual(len({c.row for c in result.checks}), len(result.checks))
+            # Fuerza bruta: ningún subconjunto con menos e-cheques da la misma suma.
+            from itertools import combinations
+            for k in range(1, len(result.checks)):
+                self.assertFalse(any(sum(c) == best.total for c in combinations(values, k)))
 
 
 class ImportTests(unittest.TestCase):

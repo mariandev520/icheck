@@ -12,7 +12,7 @@ from pathlib import Path
 from tkinter import filedialog, font, messagebox, simpledialog, ttk
 
 from core import (DataError, batch_label, check_date, customer_message, delete_selection,
-                  entry_to_result, exclude_saved, filter_checks, find_combination, find_progressive,
+                  entry_to_result, exclude_saved, filter_checks, find_combination, find_fewest, find_progressive,
                   list_sheets, load_registry, money, parse_amount, parse_date, read_excel,
                   registry_path, save_selection, saved_overlap)
 
@@ -330,7 +330,7 @@ class Application:
         search_options = tk.Frame(entry_card, bg=BG_PANEL)
         search_options.pack(fill="x", pady=(2, 8))
         self.strategy_box = ttk.Combobox(search_options, textvariable=self.strategy, state="readonly",
-            values=("Progresiva · mayor a menor", "Mejor suma posible"))
+            values=("Progresiva · mayor a menor", "Mejor suma posible", "Mejor suma · menos e-cheques"))
         self.strategy_box.pack(fill="x")
         self.previous_toggle = tk.Checkbutton(search_options, text="Priorizar la tanda de una semana anterior",
             variable=self.prefer_previous, bg=BG_PANEL, fg=TEXT_MID, selectcolor=BG_SURFACE,
@@ -724,6 +724,7 @@ class Application:
             messagebox.showwarning("Sin e-cheques para esas fechas", "No hay registros disponibles que cumplan el cliente y el rango elegidos. {} tienen la fecha vacía o inválida y {} ya están guardados en el registro.".format(excluded_dates, excluded_saved))
             return
         progressive = self.strategy.get().startswith("Progresiva")
+        fewest = self.strategy.get().endswith("menos e-cheques")
         prefer_previous = self.prefer_previous.get()
         self.search_context = {"file": Path(self.path).name, "sheet": self.imported.sheet,
                                "client": self.client.get(), "date_field": date_field, "from": self.date_from.get(), "to": self.date_to.get(),
@@ -736,6 +737,10 @@ class Application:
             progress = lambda message: self.events.put(("progress", message))
             if progressive:
                 return find_progressive(checks, target, self.cancel, progress, date_field, prefer_previous)
+            if fewest:
+                result = find_fewest(checks, target, self.cancel, progress)
+                result.date_field = date_field
+                return result
             result = find_combination(checks, target, self.cancel, progress)
             result.date_field = date_field
             return result
@@ -767,6 +772,12 @@ class Application:
         elif not result.checks:
             title = "Ningún e-cheque entra en el importe solicitado"
             detail = "Los e-cheques disponibles superan el objetivo. El importe completo queda a completar por transferencia."
+        elif result.strategy == "fewest":
+            title = "Mejor suma · con los e-cheques más altos"
+            detail = "{} e-cheques, de mayor a menor. {} Faltan {} por transferencia.".format(
+                len(result.checks),
+                "Es la menor cantidad posible para esa suma." if result.count_minimal
+                else "Menor cantidad encontrada; podría existir una con menos.", money(result.transfer))
         elif result.strategy == "progressive":
             title = "Selección progresiva · de mayor a menor"
             detail = "{} e-cheques elegidos por monto y tandas. Faltan {}. Otra combinación podría cubrir más.".format(len(result.checks), money(result.transfer))
@@ -882,7 +893,8 @@ class Application:
                 writer.writerow(["Hoja", safe(self.search_context.get("sheet", ""))])
                 state = ("Selección guardada en el registro" if self.search_context.get("saved") else
                          "Búsqueda detenida; óptimo no confirmado" if not self.result.completed else
-                         "Selección progresiva" if self.result.strategy == "progressive" else "Óptimo confirmado")
+                         "Selección progresiva" if self.result.strategy == "progressive" else
+                         "Mejor suma con menos e-cheques" if self.result.strategy == "fewest" else "Óptimo confirmado")
                 writer.writerow(["Estado", state])
                 writer.writerow(["Fecha usada", self.result.date_field])
                 writer.writerow(["Desde", safe(self.search_context.get("from", ""))])
